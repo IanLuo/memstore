@@ -316,8 +316,9 @@ func TestTsRoundTrip(t *testing.T) {
 	}
 }
 
-// Card F2 / design Security: the store file is user-only and its directory is
-// user-only, whatever the umask in force when it is created.
+// Card F2 / design Security: the store file and its WAL sidecars are user-only
+// while the store is open, and its directory is user-only, whatever the umask
+// in force when they are created.
 func TestStorePermissionsUserOnly(t *testing.T) {
 	old := syscall.Umask(0o022)
 	defer syscall.Umask(old)
@@ -328,13 +329,19 @@ func TestStorePermissionsUserOnly(t *testing.T) {
 		t.Fatalf("Open: %v", err)
 	}
 	defer s.Close()
-
-	fi, err := os.Stat(path)
-	if err != nil {
-		t.Fatalf("Stat db: %v", err)
+	if _, err := s.Put(&memstore.Memory{Kind: "note", Text: "a write, so the WAL sidecars exist"}); err != nil {
+		t.Fatalf("Put: %v", err)
 	}
-	if got := fi.Mode().Perm(); got != 0o600 {
-		t.Errorf("db file mode = %o, want 600", got)
+
+	for _, p := range []string{path, path + "-wal", path + "-shm"} {
+		fi, err := os.Stat(p)
+		if err != nil {
+			t.Errorf("Stat %s: %v", filepath.Base(p), err)
+			continue
+		}
+		if got := fi.Mode().Perm(); got != 0o600 {
+			t.Errorf("%s mode = %o, want 600", filepath.Base(p), got)
+		}
 	}
 	di, err := os.Stat(filepath.Dir(path))
 	if err != nil {

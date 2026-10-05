@@ -106,11 +106,18 @@ func Open(path string) (*Store, error) {
 		db.Close()
 		return nil, fmt.Errorf("memstore: apply schema to %s: %w", path, err)
 	}
-	// The file is user-only: sqlite creates it under the umask, which may let
-	// group or other read it. The parent directory is made 0700 above.
-	if err := os.Chmod(path, 0o600); err != nil {
-		db.Close()
-		return nil, fmt.Errorf("memstore: restrict %s: %w", path, err)
+	// The store is user-only: the file and its WAL sidecars hold memory text,
+	// and sqlite creates them under the umask, which may let group or other
+	// read them. The parent directory is made 0700 above. The schema write
+	// above has created the sidecars, so they exist to restrict.
+	for _, p := range []string{path, path + "-wal", path + "-shm"} {
+		if err := os.Chmod(p, 0o600); err != nil {
+			if os.IsNotExist(err) {
+				continue
+			}
+			db.Close()
+			return nil, fmt.Errorf("memstore: restrict %s: %w", p, err)
+		}
 	}
 	return &Store{db: db, path: path}, nil
 }
