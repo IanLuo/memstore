@@ -34,7 +34,7 @@ func main() {
 		os.Exit(2)
 	}
 	if err != nil {
-		fmt.Fprintln(os.Stderr, "memstore:", err)
+		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
 }

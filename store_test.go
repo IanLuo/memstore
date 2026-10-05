@@ -4,8 +4,12 @@ import (
 	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
+	"os"
+	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
+	"time"
 
 	"memstore"
 
@@ -213,5 +217,130 @@ func TestGetMissingId(t *testing.T) {
 	s := openTemp(t)
 	if _, err := s.Get(424242); err == nil {
 		t.Error("Get(missing id): got nil error, want error")
+	}
+}
+
+// Card F1: slice 1 has no forget verb, so a caller-supplied DeletedAt is
+// refused — deletion state gets one writer, the future forget verb.
+func TestPutRefusesDeletedAt(t *testing.T) {
+	s := openTemp(t)
+	now := time.Now()
+	_, err := s.Put(&memstore.Memory{Kind: "note", Text: "already forgotten", DeletedAt: &now})
+	if err == nil {
+		t.Error("Put with DeletedAt set: got nil error, want refusal")
+	}
+}
+
+// Card F1 / spec acceptance 4: a soft-deleted row is hidden from reads. Slice 1
+// has no forget verb, so the state is set directly, as forget will set it.
+func TestSoftDeletedHiddenFromReads(t *testing.T) {
+	s := openTemp(t)
+	id, err := s.Put(&memstore.Memory{Kind: "note", Text: "soft-deleted-quokka-marker"})
+	if err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+	db, err := sql.Open("sqlite", s.Path())
+	if err != nil {
+		t.Fatalf("sql.Open: %v", err)
+	}
+	defer db.Close()
+	if _, err := db.Exec(`UPDATE memory SET deleted_at = ? WHERE id = ?`, time.Now().UnixNano(), id); err != nil {
+		t.Fatalf("mark deleted: %v", err)
+	}
+
+	if _, err := s.Get(id); err == nil {
+		t.Error("Get of a soft-deleted row: got nil error, want it hidden")
+	}
+	hits, err := s.Search("soft-deleted-quokka-marker", 5)
+	if err != nil {
+		t.Fatalf("Search: %v", err)
+	}
+	if len(hits) != 0 {
+		t.Errorf("Search found %d soft-deleted rows, want 0", len(hits))
+	}
+}
+
+// Card F1 / spec acceptance 2: only deletion hides. A closed or superseded row
+// is still returned, and a superseded row carries its successor's id.
+func TestSearchKeepsClosedAndSuperseded(t *testing.T) {
+	s := openTemp(t)
+	succ, err := s.Put(&memstore.Memory{Kind: "decision", Text: "the successor sünnset plan"})
+	if err != nil {
+		t.Fatalf("Put successor: %v", err)
+	}
+	sup := succ
+	d1, err := s.Put(&memstore.Memory{Kind: "decision", Text: "oldquokka plan", Status: "closed", Supersedes: &sup})
+	if err != nil {
+		t.Fatalf("Put superseded: %v", err)
+	}
+	closedOnly, err := s.Put(&memstore.Memory{Kind: "note", Text: "clozzured note", Status: "closed"})
+	if err != nil {
+		t.Fatalf("Put closed: %v", err)
+	}
+
+	hits, err := s.Search("oldquokka", 5)
+	if err != nil {
+		t.Fatalf("Search superseded: %v", err)
+	}
+	if len(hits) != 1 || hits[0].Id != d1 {
+		t.Fatalf("Search found %d hits (%v), want the superseded row %d", len(hits), hits, d1)
+	}
+	if hits[0].Supersedes == nil || *hits[0].Supersedes != succ {
+		t.Errorf("superseded row Supersedes = %v, want %d", hits[0].Supersedes, succ)
+	}
+
+	hits, err = s.Search("clozzured", 5)
+	if err != nil {
+		t.Fatalf("Search closed: %v", err)
+	}
+	if len(hits) != 1 || hits[0].Id != closedOnly {
+		t.Errorf("Search found %d hits (%v), want the closed row %d", len(hits), hits, closedOnly)
+	}
+}
+
+// Card F3: Ts survives Put→Get with sub-second precision and a non-UTC zone,
+// so the instant compares Equal.
+func TestTsRoundTrip(t *testing.T) {
+	s := openTemp(t)
+	ts := time.Date(2026, 10, 5, 11, 36, 15, 123456789, time.FixedZone("UTC+8", 8*3600))
+	id, err := s.Put(&memstore.Memory{Kind: "note", Text: "timestamped", Ts: ts})
+	if err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+	got, err := s.Get(id)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if !got.Ts.Equal(ts) {
+		t.Errorf("Ts = %v, want an instant Equal to %v", got.Ts, ts)
+	}
+}
+
+// Card F2 / design Security: the store file is user-only and its directory is
+// user-only, whatever the umask in force when it is created.
+func TestStorePermissionsUserOnly(t *testing.T) {
+	old := syscall.Umask(0o022)
+	defer syscall.Umask(old)
+
+	path := filepath.Join(t.TempDir(), "sub", "memory.db")
+	s, err := memstore.Open(path)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer s.Close()
+
+	fi, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("Stat db: %v", err)
+	}
+	if got := fi.Mode().Perm(); got != 0o600 {
+		t.Errorf("db file mode = %o, want 600", got)
+	}
+	di, err := os.Stat(filepath.Dir(path))
+	if err != nil {
+		t.Fatalf("Stat dir: %v", err)
+	}
+	if got := di.Mode().Perm(); got != 0o700 {
+		t.Errorf("db dir mode = %o, want 700", got)
 	}
 }

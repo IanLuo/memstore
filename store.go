@@ -106,6 +106,12 @@ func Open(path string) (*Store, error) {
 		db.Close()
 		return nil, fmt.Errorf("memstore: apply schema to %s: %w", path, err)
 	}
+	// The file is user-only: sqlite creates it under the umask, which may let
+	// group or other read it. The parent directory is made 0700 above.
+	if err := os.Chmod(path, 0o600); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("memstore: restrict %s: %w", path, err)
+	}
 	return &Store{db: db, path: path}, nil
 }
 
@@ -117,13 +123,17 @@ func (s *Store) Close() error { return s.db.Close() }
 
 // Put appends one memory and returns its id. Text and kind are required; an
 // explicit nonzero id is honoured only if it is free. Content is never
-// updated, so a second Put of an existing id is refused.
+// updated, so a second Put of an existing id is refused. A caller-supplied
+// DeletedAt is refused: deletion is forget's job, the one writer of that state.
 func (s *Store) Put(m *Memory) (int64, error) {
 	if m.Text == "" {
 		return 0, errors.New("memstore: put: text is empty")
 	}
 	if m.Kind == "" {
 		return 0, errors.New("memstore: put: kind is empty")
+	}
+	if m.DeletedAt != nil {
+		return 0, errors.New("memstore: put: deleted_at is set; deletion is forget's job")
 	}
 	ts := m.Ts
 	if ts.IsZero() {
@@ -140,8 +150,8 @@ func (s *Store) Put(m *Memory) (int64, error) {
 			(id, ts, kind, scope, title, text, extra, importance, tier, status,
 			 deleted_at, parent, supersedes, found_by, hash)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		nullableId(m.Id), ts.Unix(), m.Kind, m.Scope, m.Title, m.Text, m.Extra,
-		m.Importance, m.Tier, status, nullableTime(m.DeletedAt), m.Parent,
+		nullableId(m.Id), ts.UnixNano(), m.Kind, m.Scope, m.Title, m.Text, m.Extra,
+		m.Importance, m.Tier, status, nil, m.Parent,
 		m.Supersedes, m.FoundBy, hex.EncodeToString(sum[:]))
 	if err != nil {
 		return 0, fmt.Errorf("memstore: put: %w", err)
@@ -154,8 +164,9 @@ func (s *Store) Put(m *Memory) (int64, error) {
 }
 
 // Get returns one memory by id. A missing id is an error, never a zero memory.
+// A soft-deleted row is hidden, as if missing.
 func (s *Store) Get(id int64) (Memory, error) {
-	row := s.db.QueryRow(`SELECT `+memoryCols+` FROM memory WHERE id = ?`, id)
+	row := s.db.QueryRow(`SELECT `+memoryCols+` FROM memory WHERE id = ? AND deleted_at IS NULL`, id)
 	m, err := scanMemory(row)
 	if err != nil {
 		return Memory{}, fmt.Errorf("memstore: get %d: %w", id, err)
@@ -164,8 +175,8 @@ func (s *Store) Get(id int64) (Memory, error) {
 }
 
 // Search returns up to k memories matching q, best first. Matching is lexical
-// (FTS5) in this slice; the relation walk and vectors come later. No match is
-// an empty result, not an error.
+// (FTS5) in this slice; the relation walk and vectors come later. Soft-deleted
+// rows are excluded. No match is an empty result, not an error.
 func (s *Store) Search(q string, k int) ([]Memory, error) {
 	match := ftsQuery(q)
 	if k <= 0 || match == "" {
@@ -176,6 +187,7 @@ func (s *Store) Search(q string, k int) ([]Memory, error) {
 		FROM record_fts
 		JOIN memory ON memory.id = record_fts.rowid
 		WHERE record_fts MATCH ?
+		AND memory.deleted_at IS NULL
 		ORDER BY bm25(record_fts)
 		LIMIT ?`, match, k)
 	if err != nil {
@@ -221,9 +233,9 @@ func scanMemory(sc scanner) (Memory, error) {
 		&m.FoundBy, &m.Hash); err != nil {
 		return Memory{}, err
 	}
-	m.Ts = time.Unix(ts, 0).UTC()
+	m.Ts = time.Unix(0, ts).UTC()
 	if deletedAt.Valid {
-		t := time.Unix(deletedAt.Int64, 0).UTC()
+		t := time.Unix(0, deletedAt.Int64).UTC()
 		m.DeletedAt = &t
 	}
 	if parent.Valid {
@@ -256,12 +268,4 @@ func nullableId(id int64) any {
 		return nil
 	}
 	return id
-}
-
-// nullableTime maps a nil timestamp to NULL.
-func nullableTime(t *time.Time) any {
-	if t == nil {
-		return nil
-	}
-	return t.Unix()
 }
