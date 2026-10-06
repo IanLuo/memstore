@@ -29,6 +29,16 @@ func main() {
 		err = runGet(os.Args[2:])
 	case "search":
 		err = runSearch(os.Args[2:])
+	case "close":
+		err = runClose(os.Args[2:])
+	case "forget":
+		err = runForget(os.Args[2:])
+	case "recent":
+		err = runRecent(os.Args[2:])
+	case "link":
+		err = runLink(os.Args[2:])
+	case "stats":
+		err = runStats(os.Args[2:])
 	default:
 		usage()
 		os.Exit(2)
@@ -55,6 +65,11 @@ func usage() {
   put -kind KIND [-scope S] [-title T] [TEXT...]  append a memory; TEXT from args or stdin
   get ID                                          one memory, as JSON
   search [-k N] QUERY...                          matching memories, as JSON, best first
+  close ID [REPLACED_BY]                          close a memory; optionally retired in favour of another
+  forget ID                                       hide a memory (soft delete; its bytes remain)
+  recent [-k N] [SCOPE...]                        newest memories first, as JSON
+  link FROM REL TO                                record an edge; the walk surfaces superseded-by / found-by
+  stats                                           the store's shape: counts, file bytes, ts bounds
 
 The store is $MEMSTORE_DB, or ~/.memstore/memory.db.
 `)
@@ -142,6 +157,111 @@ func runSearch(args []string) error {
 		hits = []memstore.Memory{}
 	}
 	return writeJSON(hits)
+}
+
+func runClose(args []string) error {
+	fs := flag.NewFlagSet("close", flag.ExitOnError)
+	fs.Parse(args)
+	if fs.NArg() < 1 || fs.NArg() > 2 {
+		return errors.New("close: want an id and optionally the replacing id")
+	}
+	id, err := strconv.ParseInt(fs.Arg(0), 10, 64)
+	if err != nil {
+		return fmt.Errorf("close: bad id %q: %w", fs.Arg(0), err)
+	}
+	var replacedBy *int64
+	if fs.NArg() == 2 {
+		r, err := strconv.ParseInt(fs.Arg(1), 10, 64)
+		if err != nil {
+			return fmt.Errorf("close: bad replacing id %q: %w", fs.Arg(1), err)
+		}
+		replacedBy = &r
+	}
+	s, err := openStore()
+	if err != nil {
+		return err
+	}
+	defer s.Close()
+	return s.CloseMemory(id, replacedBy)
+}
+
+func runForget(args []string) error {
+	fs := flag.NewFlagSet("forget", flag.ExitOnError)
+	fs.Parse(args)
+	if fs.NArg() != 1 {
+		return errors.New("forget: want exactly one id")
+	}
+	id, err := strconv.ParseInt(fs.Arg(0), 10, 64)
+	if err != nil {
+		return fmt.Errorf("forget: bad id %q: %w", fs.Arg(0), err)
+	}
+	s, err := openStore()
+	if err != nil {
+		return err
+	}
+	defer s.Close()
+	return s.Forget(id)
+}
+
+func runRecent(args []string) error {
+	fs := flag.NewFlagSet("recent", flag.ExitOnError)
+	k := fs.Int("k", 10, "maximum number of memories")
+	fs.Parse(args)
+	scope := strings.Join(fs.Args(), " ")
+	s, err := openStore()
+	if err != nil {
+		return err
+	}
+	defer s.Close()
+	rec, err := s.Recent(scope, *k)
+	if err != nil {
+		return err
+	}
+	if rec == nil {
+		rec = []memstore.Memory{}
+	}
+	return writeJSON(rec)
+}
+
+func runLink(args []string) error {
+	fs := flag.NewFlagSet("link", flag.ExitOnError)
+	fs.Parse(args)
+	if fs.NArg() != 3 {
+		return errors.New("link: want from, relation, and to")
+	}
+	from, err := strconv.ParseInt(fs.Arg(0), 10, 64)
+	if err != nil {
+		return fmt.Errorf("link: bad from %q: %w", fs.Arg(0), err)
+	}
+	rel := fs.Arg(1)
+	to, err := strconv.ParseInt(fs.Arg(2), 10, 64)
+	if err != nil {
+		return fmt.Errorf("link: bad to %q: %w", fs.Arg(2), err)
+	}
+	s, err := openStore()
+	if err != nil {
+		return err
+	}
+	defer s.Close()
+	return s.Link(from, rel, to)
+}
+
+func runStats(args []string) error {
+	fs := flag.NewFlagSet("stats", flag.ExitOnError)
+	fs.Parse(args)
+	if fs.NArg() != 0 {
+		return errors.New("stats: takes no arguments")
+	}
+	s, err := openStore()
+	if err != nil {
+		return err
+	}
+	defer s.Close()
+	st, err := s.Stats()
+	if err != nil {
+		return err
+	}
+	return writeJSON(st)
 }
 
 func openStore() (*memstore.Store, error) {

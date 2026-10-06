@@ -19,7 +19,9 @@ import (
 
 // Memory is one row of the memory table, the store's only source of truth.
 // Id..Hash are content and are written once; Status, DeletedAt and Tier are
-// lifecycle columns and are the only fields Put may change later.
+// lifecycle columns and are the only fields Put may change later. Related is
+// not a column at all: Search fills it, from the edge table, when the row is
+// a search hit; the other verbs leave it nil.
 type Memory struct {
 	Id         int64
 	Ts         time.Time
@@ -36,6 +38,16 @@ type Memory struct {
 	Supersedes *int64
 	FoundBy    string
 	Hash       string
+	Related    []Related
+}
+
+// Related is one memory another memory points at: the target of an outgoing
+// superseded-by or found-by edge. Search surfaces these on a hit so a found
+// memory shows where it sits; the supersedes column is carried separately, on
+// Supersedes.
+type Related struct {
+	Rel string
+	To  int64
 }
 
 // Store is an open memory file.
@@ -54,8 +66,19 @@ const schemaVersion = 2
 // schema is the whole database. record_fts is FTS5 external content over
 // memory (title, text): the text is indexed in place, never copied. Only an
 // INSERT trigger exists, because content is immutable; status, deleted_at and
-// tier may change without touching the index.
+// tier may change without touching the index. edge is the thin relation table
+// of slice 2: enough to store an arbitrary relation between two memories and
+// walk it, nothing more. Adding it is additive — schema_version still names
+// the timestamp format (2, unix nanoseconds), so an existing v2 file gains
+// the table on open the same way it keeps the rest of the schema.
 const schema = `
+CREATE TABLE IF NOT EXISTS edge (
+	from_id INTEGER NOT NULL REFERENCES memory(id),
+	rel     TEXT    NOT NULL,
+	to_id   INTEGER NOT NULL REFERENCES memory(id),
+	ts      INTEGER NOT NULL,
+	PRIMARY KEY (from_id, rel, to_id)
+);
 CREATE TABLE IF NOT EXISTS memory (
 	id         INTEGER PRIMARY KEY AUTOINCREMENT,
 	ts         INTEGER NOT NULL,
@@ -150,11 +173,12 @@ func Open(path string) (*Store, error) {
 	return &Store{db: db, path: path}, nil
 }
 
-// tsMin and tsMax bound the instants time.Time can represent as unix
-// nanoseconds, inclusive. UnixNano would wrap silently outside these — a
-// wrong value, not an error — so Put refuses before storing.
+// tsMin and tsMax are the true bounds of the unix-nanosecond range time.Time
+// can represent, inclusive (time.Unix(0, math.MinInt64) and MaxInt64)
+// rendered in UTC. UnixNano would wrap silently outside these — a wrong
+// value, not an error — so Put refuses before storing.
 var (
-	tsMin = time.Date(1678, 9, 21, 0, 12, 43, 145224192, time.UTC)
+	tsMin = time.Date(1677, 9, 21, 0, 12, 43, 145224192, time.UTC)
 	tsMax = time.Date(2262, 4, 11, 23, 47, 16, 854775807, time.UTC)
 )
 
@@ -221,8 +245,10 @@ func (s *Store) Get(id int64) (Memory, error) {
 }
 
 // Search returns up to k memories matching q, best first. Matching is lexical
-// (FTS5) in this slice; the relation walk and vectors come later. Soft-deleted
-// rows are excluded. No match is an empty result, not an error.
+// (FTS5), bridged by the relation walk: each hit's Related carries the ids its
+// outgoing superseded-by and found-by edges name, so a found memory shows
+// where it sits (the supersedes column rides on Supersedes, as always).
+// Soft-deleted rows are excluded. No match is an empty result, not an error.
 func (s *Store) Search(q string, k int) ([]Memory, error) {
 	match := ftsQuery(q)
 	if k <= 0 || match == "" {
@@ -241,18 +267,229 @@ func (s *Store) Search(q string, k int) ([]Memory, error) {
 	}
 	defer rows.Close()
 
+	out, err := scanAll(rows)
+	if err != nil {
+		return nil, fmt.Errorf("memstore: search: %w", err)
+	}
+	for i := range out {
+		rel, err := s.walkEdges(out[i].Id)
+		if err != nil {
+			return nil, fmt.Errorf("memstore: search: %w", err)
+		}
+		out[i].Related = rel
+	}
+	return out, nil
+}
+
+// CloseMemory retires one memory: status becomes closed, and Close is the
+// only writer of that state. With a replacement, supersedes and the
+// superseded-by edge are recorded in the same transaction. Closing a row that
+// is already closed is a no-op — the first close owns the state; unknown and
+// forgotten ids are errors.
+func (s *Store) CloseMemory(id int64, replacedBy *int64) error {
+	if err := s.requireLive(id); err != nil {
+		return fmt.Errorf("memstore: close: %w", err)
+	}
+	if replacedBy != nil {
+		if err := s.requireLive(*replacedBy); err != nil {
+			return fmt.Errorf("memstore: close: replacement: %w", err)
+		}
+	}
+	var status string
+	if err := s.db.QueryRow(`SELECT status FROM memory WHERE id = ?`, id).Scan(&status); err != nil {
+		return fmt.Errorf("memstore: close: %w", err)
+	}
+	if status == "closed" {
+		return nil
+	}
+	tx, err := s.db.Begin()
+	if err != nil {
+		return fmt.Errorf("memstore: close: %w", err)
+	}
+	defer tx.Rollback()
+	if replacedBy != nil {
+		if _, err := tx.Exec(`UPDATE memory SET status = 'closed', supersedes = ? WHERE id = ?`, *replacedBy, id); err != nil {
+			return fmt.Errorf("memstore: close: %w", err)
+		}
+		if _, err := tx.Exec(`INSERT OR IGNORE INTO edge (from_id, rel, to_id, ts) VALUES (?, 'superseded-by', ?, ?)`, id, *replacedBy, time.Now().UnixNano()); err != nil {
+			return fmt.Errorf("memstore: close: %w", err)
+		}
+	} else {
+		if _, err := tx.Exec(`UPDATE memory SET status = 'closed' WHERE id = ?`, id); err != nil {
+			return fmt.Errorf("memstore: close: %w", err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("memstore: close: %w", err)
+	}
+	return nil
+}
+
+// Forget softly deletes one memory: deleted_at is set, and the row is hidden
+// from Get, Search, Recent and Stats' open count while its bytes remain. No
+// verb destroys bytes and none restores — this slice has no un-forget. An
+// unknown or already-forgotten id is an error.
+func (s *Store) Forget(id int64) error {
+	res, err := s.db.Exec(`UPDATE memory SET deleted_at = ? WHERE id = ? AND deleted_at IS NULL`, time.Now().UnixNano(), id)
+	if err != nil {
+		return fmt.Errorf("memstore: forget: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("memstore: forget: %w", err)
+	}
+	if n == 0 {
+		return fmt.Errorf("memstore: forget: no live memory %d", id)
+	}
+	return nil
+}
+
+// Recent returns up to k memories by time — newest ts first — optionally
+// restricted to one scope. Forgotten rows are excluded and k <= 0 is an empty
+// result. It never ranks by meaning; that is Search's job.
+func (s *Store) Recent(scope string, k int) ([]Memory, error) {
+	if k <= 0 {
+		return nil, nil
+	}
+	query := `SELECT ` + memoryCols + ` FROM memory WHERE deleted_at IS NULL`
+	args := []any{}
+	if scope != "" {
+		query += ` AND scope = ?`
+		args = append(args, scope)
+	}
+	query += ` ORDER BY ts DESC, id DESC LIMIT ?`
+	args = append(args, k)
+	rows, err := s.db.Query(query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("memstore: recent: %w", err)
+	}
+	defer rows.Close()
+
+	out, err := scanAll(rows)
+	if err != nil {
+		return nil, fmt.Errorf("memstore: recent: %w", err)
+	}
+	return out, nil
+}
+
+// scanAll reads every Memory a query's rows carry; the caller closes rows.
+func scanAll(rows *sql.Rows) ([]Memory, error) {
 	var out []Memory
 	for rows.Next() {
 		m, err := scanMemory(rows)
 		if err != nil {
-			return nil, fmt.Errorf("memstore: search: %w", err)
+			return nil, err
 		}
 		out = append(out, m)
 	}
 	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("memstore: search: %w", err)
+		return nil, err
 	}
 	return out, nil
+}
+
+// Link records one edge from the memory from to the memory to, labelled with
+// the open text rel. Both ends must be live memory rows; a repeated identical
+// Link is a no-op. The walk surfaces the superseded-by and found-by relations
+// on Search hits; every other rel is stored but not surfaced.
+func (s *Store) Link(from int64, rel string, to int64) error {
+	if err := s.requireLive(from); err != nil {
+		return fmt.Errorf("memstore: link: %w", err)
+	}
+	if err := s.requireLive(to); err != nil {
+		return fmt.Errorf("memstore: link: %w", err)
+	}
+	if _, err := s.db.Exec(`INSERT OR IGNORE INTO edge (from_id, rel, to_id, ts) VALUES (?, ?, ?, ?)`, from, rel, to, time.Now().UnixNano()); err != nil {
+		return fmt.Errorf("memstore: link: %w", err)
+	}
+	return nil
+}
+
+// Stats is the store's own shape: row counts over all rows, the db file's
+// byte size (and the WAL's, while it exists), and the newest and oldest ts
+// present. The ts bounds span hidden rows too, because their bytes are still
+// in the file.
+type Stats struct {
+	Total     int64
+	Open      int64
+	Forgotten int64
+	Bytes     int64
+	WalBytes  int64
+	Newest    *time.Time
+	Oldest    *time.Time
+}
+
+// Stats returns the store's shape; it writes nothing.
+func (s *Store) Stats() (Stats, error) {
+	var st Stats
+	fi, err := os.Stat(s.path)
+	if err != nil {
+		return st, fmt.Errorf("memstore: stats: %w", err)
+	}
+	st.Bytes = fi.Size()
+	if wfi, err := os.Stat(s.path + "-wal"); err == nil {
+		st.WalBytes = wfi.Size()
+	}
+	if err := s.db.QueryRow(`SELECT count(*), count(deleted_at) FROM memory`).Scan(&st.Total, &st.Forgotten); err != nil {
+		return st, fmt.Errorf("memstore: stats: %w", err)
+	}
+	st.Open = st.Total - st.Forgotten
+	var newest, oldest sql.NullInt64
+	if err := s.db.QueryRow(`SELECT max(ts), min(ts) FROM memory`).Scan(&newest, &oldest); err != nil {
+		return st, fmt.Errorf("memstore: stats: %w", err)
+	}
+	st.Newest, st.Oldest = unixTime(newest), unixTime(oldest)
+	return st, nil
+}
+
+// requireLive succeeds only when id names a row the verbs still show: present
+// and not forgotten. A forgotten row hides from the whole surface, "as if
+// missing".
+func (s *Store) requireLive(id int64) error {
+	var n int
+	if err := s.db.QueryRow(`SELECT count(*) FROM memory WHERE id = ? AND deleted_at IS NULL`, id).Scan(&n); err != nil {
+		return err
+	}
+	if n == 0 {
+		return fmt.Errorf("no live memory %d", id)
+	}
+	return nil
+}
+
+// walkEdges returns the outgoing superseded-by and found-by edges of id, the
+// relations a Search hit surfaces so a found memory shows where it sits.
+func (s *Store) walkEdges(id int64) ([]Related, error) {
+	rows, err := s.db.Query(`
+		SELECT rel, to_id FROM edge
+		WHERE from_id = ? AND rel IN ('superseded-by', 'found-by')
+		ORDER BY ts, to_id`, id)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	out := []Related{}
+	for rows.Next() {
+		var r Related
+		if err := rows.Scan(&r.Rel, &r.To); err != nil {
+			return nil, err
+		}
+		out = append(out, r)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// unixTime turns a stored nanosecond timestamp into a UTC time; a NULL (there
+// are no rows) is nil.
+func unixTime(v sql.NullInt64) *time.Time {
+	if !v.Valid {
+		return nil
+	}
+	t := time.Unix(0, v.Int64).UTC()
+	return &t
 }
 
 // memoryCols is the full column list, in the order scanMemory reads it.

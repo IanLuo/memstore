@@ -30,6 +30,21 @@ func TestErrorMessageOnePrefix(t *testing.T) {
 			err:  errors.New("search: empty query"),
 			want: "memstore: search: empty query",
 		},
+		{
+			name: "CLI-local close bad id",
+			err:  errors.New(`close: bad id "x": parsing "x": invalid syntax`),
+			want: `memstore: close: bad id "x": parsing "x": invalid syntax`,
+		},
+		{
+			name: "CLI-local link arity",
+			err:  errors.New("link: want from, relation, and to"),
+			want: "memstore: link: want from, relation, and to",
+		},
+		{
+			name: "CLI-local stats arity",
+			err:  errors.New("stats: takes no arguments"),
+			want: "memstore: stats: takes no arguments",
+		},
 	} {
 		got := errorMessage(tc.err)
 		if got != tc.want {

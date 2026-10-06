@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/hex"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"strings"
@@ -348,19 +349,33 @@ func TestTsRoundTrip(t *testing.T) {
 	}
 }
 
-// Card A3: UnixNano wraps silently outside time.Time's representable range, so
-// Put refuses a Ts there — with the range named — instead of storing a wrong
-// instant; the bounds themselves still round-trip.
+// Card A3 (with the slice-2 bound fix): UnixNano wraps silently outside
+// time.Time's representable range, so Put refuses a Ts there — with the true
+// limits [1677-09-21T00:12:43.145224192Z, 2262-04-11T23:47:16.854775807Z]
+// named — instead of storing a wrong instant; the bounds themselves still
+// round-trip.
 func TestPutRefusesOutOfRangeTs(t *testing.T) {
 	s := openTemp(t)
 	_, err := s.Put(&memstore.Memory{Kind: "note", Text: "year 2300", Ts: time.Date(2300, 1, 1, 0, 0, 0, 0, time.UTC)})
 	if err == nil {
 		t.Error("Put with Ts year 2300: got nil error, want refusal")
-	} else if got := err.Error(); !strings.Contains(got, "1678") || !strings.Contains(got, "2262") {
+	} else if got := err.Error(); !strings.Contains(got, "1677") || !strings.Contains(got, "2262") {
 		t.Errorf("refusal %q does not name the timestamp limits", got)
 	}
+	// A nanosecond below the true lower bound (or above the upper one) must be
+	// refused, never wrapped.
 	for _, ts := range []time.Time{
-		time.Date(1678, 9, 21, 0, 12, 43, 145224192, time.UTC),
+		time.Unix(0, math.MinInt64).Add(-time.Nanosecond),
+		time.Unix(0, math.MaxInt64).Add(time.Nanosecond),
+	} {
+		if _, err := s.Put(&memstore.Memory{Kind: "note", Text: "past the nanosecond edge", Ts: ts}); err == nil {
+			t.Errorf("Put just outside the range (%v): got nil error, want refusal", ts)
+		} else if got := err.Error(); !strings.Contains(got, "1677") || !strings.Contains(got, "2262") {
+			t.Errorf("refusal %q does not name the timestamp limits", got)
+		}
+	}
+	for _, ts := range []time.Time{
+		time.Date(1677, 9, 21, 0, 12, 43, 145224192, time.UTC),
 		time.Date(2262, 4, 11, 23, 47, 16, 854775807, time.UTC),
 	} {
 		id, err := s.Put(&memstore.Memory{Kind: "note", Text: "at the nanosecond boundary", Ts: ts})
@@ -381,6 +396,424 @@ func TestPutRefusesOutOfRangeTs(t *testing.T) {
 // sidecars are 0600, and the parent directory that Open creates is 0700 — even
 // under a permissive umask. It does not claim a caller's pre-existing
 // directory is touched; Open leaves that as it is.
+// Card 2 / spec AC2: Close retires a record — status closed, text intact, no
+// deleted_at. With a replacement the result carries it: on the supersedes
+// column and, because Close records the superseded-by edge, on the search
+// walk's Related list too.
+func TestCloseSetsStatusAndReplaces(t *testing.T) {
+	s := openTemp(t)
+	d1, err := s.Put(&memstore.Memory{Kind: "decision", Text: "closeable-quokka-plan"})
+	if err != nil {
+		t.Fatalf("Put D1: %v", err)
+	}
+	d2, err := s.Put(&memstore.Memory{Kind: "decision", Text: "the successor plan, sünnset"})
+	if err != nil {
+		t.Fatalf("Put D2: %v", err)
+	}
+
+	if err := s.CloseMemory(d1, &d2); err != nil {
+		t.Fatalf("CloseMemory: %v", err)
+	}
+	got, err := s.Get(d1)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if got.Status != "closed" {
+		t.Errorf("Status = %q, want closed", got.Status)
+	}
+	if got.Text != "closeable-quokka-plan" {
+		t.Errorf("Text changed by Close: %q", got.Text)
+	}
+	if got.Supersedes == nil || *got.Supersedes != d2 {
+		t.Errorf("Supersedes = %v, want %d", got.Supersedes, d2)
+	}
+	if got.DeletedAt != nil {
+		t.Error("Close touched deleted_at; only Forget may")
+	}
+
+	hits, err := s.Search("closeable-quokka", 5)
+	if err != nil {
+		t.Fatalf("Search: %v", err)
+	}
+	if len(hits) != 1 {
+		t.Fatalf("Search found %d hits, want the closed row %d", len(hits), d1)
+	}
+	// Spec AC2: the hit carries the successor's id.
+	if hits[0].Supersedes == nil || *hits[0].Supersedes != d2 {
+		t.Errorf("search hit Supersedes = %v, want %d", hits[0].Supersedes, d2)
+	}
+	if !hasRel(hits[0].Related, "superseded-by", d2) {
+		t.Errorf("search hit Related = %v, want the superseded-by edge to %d", hits[0].Related, d2)
+	}
+}
+
+// Card 2: unknown id and a forgotten row are errors; a second Close is a
+// no-op — the first close owns the state.
+func TestCloseErrorsAndSecondNoOp(t *testing.T) {
+	s := openTemp(t)
+	if err := s.CloseMemory(424242, nil); err == nil {
+		t.Error("CloseMemory(unknown id): got nil error, want error")
+	}
+	d, err := s.Put(&memstore.Memory{Kind: "note", Text: "double-closeable"})
+	if err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+	if err := s.CloseMemory(d, nil); err != nil {
+		t.Fatalf("CloseMemory: %v", err)
+	}
+	if err := s.CloseMemory(d, nil); err != nil {
+		t.Errorf("second CloseMemory: %v, want no-op (nil)", err)
+	}
+	got, err := s.Get(d)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if got.Status != "closed" {
+		t.Errorf("Status = %q after no-op second close, want closed", got.Status)
+	}
+
+	// A replacement that does not name a live memory must refuse and change
+	// nothing — fail closed, never half-written.
+	healthy, _ := s.Put(&memstore.Memory{Kind: "note", Text: "must-not-be-replaced-by-void"})
+	missing := int64(99991)
+	if err := s.CloseMemory(healthy, &missing); err == nil {
+		t.Error("CloseMemory with unknown replacement: got nil error, want refusal")
+	}
+	got, err = s.Get(healthy)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if got.Status != "open" || got.Supersedes != nil {
+		t.Errorf("Close with bad replacement half-wrote: status=%q supersedes=%v", got.Status, got.Supersedes)
+	}
+
+	// A forgotten row is hidden from the verbs, as if missing.
+	f, _ := s.Put(&memstore.Memory{Kind: "note", Text: "forgotten-then-closed"})
+	if err := s.Forget(f); err != nil {
+		t.Fatalf("Forget: %v", err)
+	}
+	if err := s.CloseMemory(f, nil); err == nil {
+		t.Error("CloseMemory of a forgotten row: got nil error, want refusal")
+	}
+}
+
+// Card 3 / spec AC4: Forget hides the row from Get, Search and Recent, keeps
+// its bytes, and leaves the db file's size unchanged.
+func TestForgetHidesAndKeepsBytes(t *testing.T) {
+	s := openTemp(t)
+	id, err := s.Put(&memstore.Memory{Kind: "note", Text: "forgettable-payload-line1\nline2"})
+	if err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+	keep, err := s.Put(&memstore.Memory{Kind: "note", Text: "still-live-sibling"})
+	if err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+
+	before, err := os.Stat(s.Path())
+	if err != nil {
+		t.Fatalf("Stat db before forget: %v", err)
+	}
+	if err := s.Forget(id); err != nil {
+		t.Fatalf("Forget: %v", err)
+	}
+
+	if _, err := s.Get(id); err == nil {
+		t.Error("Get of a forgotten row: got nil error, want hidden")
+	}
+	hits, err := s.Search("forgettable-payload", 5)
+	if err != nil {
+		t.Fatalf("Search: %v", err)
+	}
+	if len(hits) != 0 {
+		t.Errorf("Search found %d hits for a forgotten row, want 0", len(hits))
+	}
+	rec, err := s.Recent("", 10)
+	if err != nil {
+		t.Fatalf("Recent: %v", err)
+	}
+	for _, r := range rec {
+		if r.Id == id {
+			t.Errorf("Recent returned the forgotten row %d", id)
+		}
+	}
+	if len(rec) != 1 || rec[0].Id != keep {
+		t.Errorf("Recent = %v, want only the live row %d", rec, keep)
+	}
+	st, err := s.Stats()
+	if err != nil {
+		t.Fatalf("Stats: %v", err)
+	}
+	if st.Total != 2 || st.Open != 1 || st.Forgotten != 1 {
+		t.Errorf("Stats = total %d open %d forgotten %d, want 2/1/1", st.Total, st.Open, st.Forgotten)
+	}
+
+	after, err := os.Stat(s.Path())
+	if err != nil {
+		t.Fatalf("Stat db after forget: %v", err)
+	}
+	if before.Size() != after.Size() {
+		t.Errorf("db file size changed by forget: %d -> %d; bytes must remain", before.Size(), after.Size())
+	}
+	// The bytes remain on the row itself — read past the verb surface, which
+	// hides it by design.
+	db, err := sql.Open("sqlite", s.Path())
+	if err != nil {
+		t.Fatalf("sql.Open: %v", err)
+	}
+	defer db.Close()
+	var text string
+	if err := db.QueryRow(`SELECT text FROM memory WHERE id = ?`, id).Scan(&text); err != nil {
+		t.Fatalf("row gone after forget: %v", err)
+	}
+	if text != "forgettable-payload-line1\nline2" {
+		t.Errorf("bytes not intact after forget: %q", text)
+	}
+}
+
+// Card 3: forget of an unknown or already-forgotten id is an error.
+func TestForgetUnknownAndTwice(t *testing.T) {
+	s := openTemp(t)
+	if err := s.Forget(424242); err == nil {
+		t.Error("Forget(unknown id): got nil error, want error")
+	}
+	id, err := s.Put(&memstore.Memory{Kind: "note", Text: "forget-me-twice"})
+	if err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+	if err := s.Forget(id); err != nil {
+		t.Fatalf("Forget: %v", err)
+	}
+	if err := s.Forget(id); err == nil {
+		t.Error("second Forget: got nil error, want error")
+	}
+}
+
+// Card 4: Recent is newest-ts-first, scope-AND-ed, hides forgotten rows, and
+// k <= 0 is empty. It orders by time, not by insertion.
+func TestRecentNewestFirstAndScope(t *testing.T) {
+	s := openTemp(t)
+	ts := func(y int, m time.Month, d int) time.Time {
+		return time.Date(y, m, d, 12, 0, 0, 0, time.UTC)
+	}
+	old, err := s.Put(&memstore.Memory{Kind: "note", Scope: "memstore", Text: "recent-old", Ts: ts(2026, 10, 1)})
+	if err != nil {
+		t.Fatalf("Put old: %v", err)
+	}
+	mid, err := s.Put(&memstore.Memory{Kind: "note", Scope: "other", Text: "recent-mid", Ts: ts(2026, 10, 2)})
+	if err != nil {
+		t.Fatalf("Put mid: %v", err)
+	}
+	nw, err := s.Put(&memstore.Memory{Kind: "note", Scope: "memstore", Text: "recent-new", Ts: ts(2026, 10, 3)})
+	if err != nil {
+		t.Fatalf("Put new: %v", err)
+	}
+
+	rec, err := s.Recent("", 10)
+	if err != nil {
+		t.Fatalf("Recent: %v", err)
+	}
+	if len(rec) != 3 || rec[0].Id != nw || rec[1].Id != mid || rec[2].Id != old {
+		t.Errorf("Recent = %v, want newest-first [%d %d %d]", ids(rec), nw, mid, old)
+	}
+
+	only, err := s.Recent("memstore", 10)
+	if err != nil {
+		t.Fatalf("Recent(memstore): %v", err)
+	}
+	if len(only) != 2 || only[0].Id != nw || only[1].Id != old {
+		t.Errorf("Recent(scoped) = %v, want [%d %d]", ids(only), nw, old)
+	}
+
+	if err := s.Forget(mid); err != nil {
+		t.Fatalf("Forget mid: %v", err)
+	}
+	rec, err = s.Recent("", 10)
+	if err != nil {
+		t.Fatalf("Recent: %v", err)
+	}
+	if len(rec) != 2 || rec[0].Id != nw || rec[1].Id != old {
+		t.Errorf("Recent after forget = %v, want [%d %d]", ids(rec), nw, old)
+	}
+
+	for _, k := range []int{0, -1} {
+		rec, err := s.Recent("", k)
+		if err != nil {
+			t.Fatalf("Recent(k=%d): %v", k, err)
+		}
+		if len(rec) != 0 {
+			t.Errorf("Recent(k=%d) = %v, want empty", k, rec)
+		}
+	}
+}
+
+// Card 5 / spec AC2: the relation walk — a Search hit surfaces the ids its
+// outgoing superseded-by and found-by edges name.
+func TestSearchWalkSurfacesEdges(t *testing.T) {
+	s := openTemp(t)
+	a, err := s.Put(&memstore.Memory{Kind: "note", Text: "walkable-original-mombai"})
+	if err != nil {
+		t.Fatalf("Put A: %v", err)
+	}
+	b, err := s.Put(&memstore.Memory{Kind: "note", Text: "the successor to the original"})
+	if err != nil {
+		t.Fatalf("Put B: %v", err)
+	}
+	src, err := s.Put(&memstore.Memory{Kind: "note", Text: "a journal where the original was found"})
+	if err != nil {
+		t.Fatalf("Put src: %v", err)
+	}
+	if err := s.Link(a, "superseded-by", b); err != nil {
+		t.Fatalf("Link superseded-by: %v", err)
+	}
+	if err := s.Link(a, "found-by", src); err != nil {
+		t.Fatalf("Link found-by: %v", err)
+	}
+
+	hits, err := s.Search("walkable-original", 5)
+	if err != nil {
+		t.Fatalf("Search: %v", err)
+	}
+	if len(hits) != 1 {
+		t.Fatalf("Search found %d hits, want 1", len(hits))
+	}
+	if hits[0].Id != a {
+		t.Fatalf("hit id = %d, want %d", hits[0].Id, a)
+	}
+	if got := len(hits[0].Related); got != 2 {
+		t.Errorf("walk surfaced %d relations %v, want the 2 edges", got, hits[0].Related)
+	}
+	if !hasRel(hits[0].Related, "superseded-by", b) || !hasRel(hits[0].Related, "found-by", src) {
+		t.Errorf("walk surfaced %v, want (superseded-by,%d) and (found-by,%d)", hits[0].Related, b, src)
+	}
+}
+
+// Card 5: Link refuses unknown or forgotten endpoints; a repeated identical
+// Link is a no-op — one edge, not two.
+func TestLinkValidationAndRepeatNoOp(t *testing.T) {
+	s := openTemp(t)
+	a, err := s.Put(&memstore.Memory{Kind: "note", Text: "linkable-a"})
+	if err != nil {
+		t.Fatalf("Put A: %v", err)
+	}
+	b, err := s.Put(&memstore.Memory{Kind: "note", Text: "linkable-b"})
+	if err != nil {
+		t.Fatalf("Put B: %v", err)
+	}
+	if err := s.Link(424242, "superseded-by", b); err == nil {
+		t.Error("Link with unknown from: got nil error, want error")
+	}
+	if err := s.Link(a, "superseded-by", 424242); err == nil {
+		t.Error("Link with unknown to: got nil error, want error")
+	}
+	f, _ := s.Put(&memstore.Memory{Kind: "note", Text: "linkable-forgotten"})
+	if err := s.Forget(f); err != nil {
+		t.Fatalf("Forget: %v", err)
+	}
+	if err := s.Link(a, "found-by", f); err == nil {
+		t.Error("Link to a forgotten endpoint: got nil error, want error")
+	}
+
+	if err := s.Link(a, "superseded-by", b); err != nil {
+		t.Fatalf("first Link: %v", err)
+	}
+	if err := s.Link(a, "superseded-by", b); err != nil {
+		t.Fatalf("repeated Link: %v", err)
+	}
+	db, err := sql.Open("sqlite", s.Path())
+	if err != nil {
+		t.Fatalf("sql.Open: %v", err)
+	}
+	defer db.Close()
+	var n int
+	if err := db.QueryRow(`SELECT count(*) FROM edge WHERE from_id = ? AND rel = 'superseded-by' AND to_id = ?`, a, b).Scan(&n); err != nil {
+		t.Fatalf("count edges: %v", err)
+	}
+	if n != 1 {
+		t.Errorf("edge count = %d, want 1 (repeated Link must be a no-op)", n)
+	}
+}
+
+// Card 6: Stats reports the store's own shape — counts over all rows, the db
+// file's byte size, and the newest and oldest ts present (including on rows
+// the verbs hide, because their bytes are still in the file).
+func TestStatsCountsBytesAndTsBounds(t *testing.T) {
+	s := openTemp(t)
+	ts := func(y int, m time.Month, d int) time.Time {
+		return time.Date(y, m, d, 12, 0, 0, 0, time.UTC)
+	}
+	oldestTs, newestTs, forgottenTs := ts(2025, 1, 1), ts(2026, 10, 1), ts(2024, 6, 1)
+	if _, err := s.Put(&memstore.Memory{Kind: "note", Text: "stats-oldest", Ts: oldestTs}); err != nil {
+		t.Fatalf("Put oldest: %v", err)
+	}
+	if _, err := s.Put(&memstore.Memory{Kind: "note", Text: "stats-newest", Ts: newestTs}); err != nil {
+		t.Fatalf("Put newest: %v", err)
+	}
+	forg, err := s.Put(&memstore.Memory{Kind: "note", Text: "stats-forgotten", Ts: forgottenTs})
+	if err != nil {
+		t.Fatalf("Put forgotten: %v", err)
+	}
+	if err := s.Forget(forg); err != nil {
+		t.Fatalf("Forget: %v", err)
+	}
+
+	st, err := s.Stats()
+	if err != nil {
+		t.Fatalf("Stats: %v", err)
+	}
+	if st.Total != 3 || st.Open != 2 || st.Forgotten != 1 {
+		t.Errorf("Stats = total %d open %d forgotten %d, want 3/2/1", st.Total, st.Open, st.Forgotten)
+	}
+	fi, err := os.Stat(s.Path())
+	if err != nil {
+		t.Fatalf("Stat: %v", err)
+	}
+	if st.Bytes != fi.Size() {
+		t.Errorf("Stats bytes = %d, want the actual file size %d", st.Bytes, fi.Size())
+	}
+	// The ts bounds span every row's bytes, hidden or not.
+	if st.Newest == nil || !st.Newest.Equal(newestTs) {
+		t.Errorf("Newest = %v, want %v", st.Newest, newestTs)
+	}
+	if st.Oldest == nil || !st.Oldest.Equal(forgottenTs) {
+		t.Errorf("Oldest = %v, want the forgotten row's %v", st.Oldest, forgottenTs)
+	}
+
+	// An empty store has counts of zero, no ts bounds, and a real file size.
+	empty := openTemp(t)
+	e, err := empty.Stats()
+	if err != nil {
+		t.Fatalf("Stats(empty): %v", err)
+	}
+	if e.Total != 0 || e.Open != 0 || e.Forgotten != 0 {
+		t.Errorf("Stats(empty) = total %d open %d forgotten %d, want 0/0/0", e.Total, e.Open, e.Forgotten)
+	}
+	if e.Newest != nil || e.Oldest != nil {
+		t.Errorf("Stats(empty) ts bounds = %v/%v, want nil", e.Newest, e.Oldest)
+	}
+	if e.Bytes == 0 {
+		// the file exists and carries schema pages, so the size is nonzero
+		t.Errorf("Stats(empty) bytes = 0, want the real file size")
+	}
+}
+
+func ids(ms []memstore.Memory) []int64 {
+	out := make([]int64, len(ms))
+	for i, m := range ms {
+		out[i] = m.Id
+	}
+	return out
+}
+
+func hasRel(rs []memstore.Related, rel string, to int64) bool {
+	for _, r := range rs {
+		if r.Rel == rel && r.To == to {
+			return true
+		}
+	}
+	return false
+}
+
 func TestStorePermissionsUserOnly(t *testing.T) {
 	old := syscall.Umask(0o022)
 	defer syscall.Umask(old)
