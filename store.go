@@ -44,6 +44,13 @@ type Store struct {
 	path string
 }
 
+// schemaVersion is the schema_version row's current value: 2, the
+// unix-nanosecond timestamp format. Version 1 (unix seconds) existed only in
+// the unversioned first release; a file stamped with anything else is refused
+// on Open, never silently migrated or misread. Keep the INSERT literal in
+// schema equal to this; TestSchemaVersion pins both.
+const schemaVersion = 2
+
 // schema is the whole database. record_fts is FTS5 external content over
 // memory (title, text): the text is indexed in place, never copied. Only an
 // INSERT trigger exists, because content is immutable; status, deleted_at and
@@ -79,7 +86,7 @@ END;
 
 CREATE TABLE IF NOT EXISTS schema_version (version INTEGER NOT NULL);
 INSERT INTO schema_version(version)
-	SELECT 1 WHERE NOT EXISTS (SELECT 1 FROM schema_version);
+	SELECT 2 WHERE NOT EXISTS (SELECT 1 FROM schema_version);
 `
 
 // Open opens the memory file at path, creating it and its parent directory if
@@ -98,6 +105,26 @@ func Open(path string) (*Store, error) {
 	// One writer by design; a single connection keeps concurrent callers from
 	// racing two connections into SQLITE_BUSY.
 	db.SetMaxOpenConns(1)
+	// Refuse a file stamped with a schema_version we do not expect before
+	// anything touches it — no WAL, no schema write, no chmod. A version-1 file
+	// stores ts in seconds, not nanoseconds, and reading it as current would
+	// silently show 1970.
+	var stamped int
+	if err := db.QueryRow(`SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'schema_version'`).Scan(&stamped); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("memstore: read %s: %w", path, err)
+	}
+	if stamped == 1 {
+		v := 0
+		if err := db.QueryRow(`SELECT version FROM schema_version`).Scan(&v); err != nil {
+			db.Close()
+			return nil, fmt.Errorf("memstore: read schema_version from %s: %w", path, err)
+		}
+		if v != schemaVersion {
+			db.Close()
+			return nil, fmt.Errorf("memstore: open %s: schema_version is %d, want %d (unix-nanosecond timestamps)", path, v, schemaVersion)
+		}
+	}
 	if _, err := db.Exec(`PRAGMA journal_mode = WAL; PRAGMA synchronous = FULL;`); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("memstore: configure %s: %w", path, err)
@@ -108,8 +135,9 @@ func Open(path string) (*Store, error) {
 	}
 	// The store is user-only: the file and its WAL sidecars hold memory text,
 	// and sqlite creates them under the umask, which may let group or other
-	// read them. The parent directory is made 0700 above. The schema write
-	// above has created the sidecars, so they exist to restrict.
+	// read them. The parent directory is created 0700 when Open creates it; a
+	// pre-existing directory is the caller's and keeps its mode. The schema
+	// write above has created the sidecars, so they exist to restrict.
 	for _, p := range []string{path, path + "-wal", path + "-shm"} {
 		if err := os.Chmod(p, 0o600); err != nil {
 			if os.IsNotExist(err) {
@@ -121,6 +149,14 @@ func Open(path string) (*Store, error) {
 	}
 	return &Store{db: db, path: path}, nil
 }
+
+// tsMin and tsMax bound the instants time.Time can represent as unix
+// nanoseconds, inclusive. UnixNano would wrap silently outside these — a
+// wrong value, not an error — so Put refuses before storing.
+var (
+	tsMin = time.Date(1678, 9, 21, 0, 12, 43, 145224192, time.UTC)
+	tsMax = time.Date(2262, 4, 11, 23, 47, 16, 854775807, time.UTC)
+)
 
 // Path is the file this store was opened on.
 func (s *Store) Path() string { return s.path }
@@ -145,6 +181,9 @@ func (s *Store) Put(m *Memory) (int64, error) {
 	ts := m.Ts
 	if ts.IsZero() {
 		ts = time.Now()
+	}
+	if ts.Before(tsMin) || ts.After(tsMax) {
+		return 0, fmt.Errorf("memstore: put: ts %s is outside the representable range %s..%s (unix nanoseconds)", ts, tsMin, tsMax)
 	}
 	status := m.Status
 	if status == "" {

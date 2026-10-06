@@ -34,9 +34,19 @@ func main() {
 		os.Exit(2)
 	}
 	if err != nil {
-		fmt.Fprintln(os.Stderr, err)
+		fmt.Fprintln(os.Stderr, errorMessage(err))
 		os.Exit(1)
 	}
+}
+
+// errorMessage returns err with the program prefix exactly once: store errors
+// already carry "memstore: ", CLI-local ones do not and are prefixed here.
+func errorMessage(err error) string {
+	msg := err.Error()
+	if strings.HasPrefix(msg, "memstore: ") {
+		return msg
+	}
+	return "memstore: " + msg
 }
 
 func usage() {

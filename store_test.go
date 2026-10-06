@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -194,7 +195,8 @@ func TestSecondPutSameIdRefused(t *testing.T) {
 	}
 }
 
-// Card section 1: a schema_version row exists.
+// Card section 1 / A1: a fresh store records schema_version 2 — the
+// unix-nanosecond timestamp format — and opens.
 func TestSchemaVersion(t *testing.T) {
 	s := openTemp(t)
 	db, err := sql.Open("sqlite", s.Path())
@@ -207,8 +209,38 @@ func TestSchemaVersion(t *testing.T) {
 	if err != nil {
 		t.Fatalf("SELECT schema_version: %v", err)
 	}
-	if v != 1 {
-		t.Errorf("schema_version = %d, want 1", v)
+	if v != 2 {
+		t.Errorf("schema_version = %d, want 2", v)
+	}
+}
+
+// Card A1: a database stamped with a schema_version Open does not expect is
+// refused on Open, naming the version found — never silently misread as if it
+// were the current format. Each stamp gets its own fresh file so a refused
+// file never backs a later stage.
+func TestOpenRefusesUnexpectedSchemaVersion(t *testing.T) {
+	for _, stamp := range []int{1, 3} {
+		path := filepath.Join(t.TempDir(), "memory.db")
+		// A fresh store records the current version; stamp the row over.
+		s, err := memstore.Open(path)
+		if err != nil {
+			t.Fatalf("Open: %v", err)
+		}
+		s.Close()
+		db, err := sql.Open("sqlite", path)
+		if err != nil {
+			t.Fatalf("sql.Open: %v", err)
+		}
+		if _, err := db.Exec(`UPDATE schema_version SET version = ?`, stamp); err != nil {
+			t.Fatalf("stamp %d: %v", stamp, err)
+		}
+		db.Close()
+
+		if _, err := memstore.Open(path); err == nil {
+			t.Errorf("Open of schema_version-%d db: got nil error, want refusal", stamp)
+		} else if got := err.Error(); !strings.Contains(got, fmt.Sprintf("schema_version is %d", stamp)) {
+			t.Errorf("Open of schema_version-%d db refused with %q, want the found version %d named", stamp, got, stamp)
+		}
 	}
 }
 
@@ -316,9 +348,39 @@ func TestTsRoundTrip(t *testing.T) {
 	}
 }
 
-// Card F2 / design Security: the store file and its WAL sidecars are user-only
-// while the store is open, and its directory is user-only, whatever the umask
-// in force when they are created.
+// Card A3: UnixNano wraps silently outside time.Time's representable range, so
+// Put refuses a Ts there — with the range named — instead of storing a wrong
+// instant; the bounds themselves still round-trip.
+func TestPutRefusesOutOfRangeTs(t *testing.T) {
+	s := openTemp(t)
+	_, err := s.Put(&memstore.Memory{Kind: "note", Text: "year 2300", Ts: time.Date(2300, 1, 1, 0, 0, 0, 0, time.UTC)})
+	if err == nil {
+		t.Error("Put with Ts year 2300: got nil error, want refusal")
+	} else if got := err.Error(); !strings.Contains(got, "1678") || !strings.Contains(got, "2262") {
+		t.Errorf("refusal %q does not name the timestamp limits", got)
+	}
+	for _, ts := range []time.Time{
+		time.Date(1678, 9, 21, 0, 12, 43, 145224192, time.UTC),
+		time.Date(2262, 4, 11, 23, 47, 16, 854775807, time.UTC),
+	} {
+		id, err := s.Put(&memstore.Memory{Kind: "note", Text: "at the nanosecond boundary", Ts: ts})
+		if err != nil {
+			t.Fatalf("Put at boundary %v: %v", ts, err)
+		}
+		got, err := s.Get(id)
+		if err != nil {
+			t.Fatalf("Get: %v", err)
+		}
+		if !got.Ts.Equal(ts) {
+			t.Errorf("Ts = %v, want Equal to boundary %v", got.Ts, ts)
+		}
+	}
+}
+
+// Card F2 / design Security: while the store is open, the file and its WAL
+// sidecars are 0600, and the parent directory that Open creates is 0700 — even
+// under a permissive umask. It does not claim a caller's pre-existing
+// directory is touched; Open leaves that as it is.
 func TestStorePermissionsUserOnly(t *testing.T) {
 	old := syscall.Umask(0o022)
 	defer syscall.Umask(old)
