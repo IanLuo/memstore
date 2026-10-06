@@ -4,7 +4,9 @@ import (
 	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
+	"errors"
 	"fmt"
+	"hash/fnv"
 	"math"
 	"os"
 	"path/filepath"
@@ -12,6 +14,7 @@ import (
 	"syscall"
 	"testing"
 	"time"
+	"unicode"
 
 	"memstore"
 
@@ -1241,5 +1244,398 @@ func TestImportErrorsWriteNothing(t *testing.T) {
 	}
 	if st.Total != 0 {
 		t.Errorf("failed timestamp import left %d rows, want 0 — import must be all-or-nothing", st.Total)
+	}
+}
+
+// --- slice 4: the open matcher surface (spec AC3) --------------------------
+
+// stubEmbed is a deterministic bag-of-words embedder for tests: lower-case
+// word tokens hashed into dim buckets, counts accumulated. It is hand-rolled
+// — no model, no network — so the same text always yields the same vector and
+// two texts share a direction only through a shared token.
+func stubEmbed(dim int) func(string) ([]float32, error) {
+	return func(text string) ([]float32, error) {
+		v := make([]float32, dim)
+		for _, tok := range wordTokens(text) {
+			h := fnv.New32a()
+			h.Write([]byte(tok))
+			v[h.Sum32()%uint32(dim)]++
+		}
+		return v, nil
+	}
+}
+
+func wordTokens(s string) []string {
+	return strings.FieldsFunc(strings.ToLower(s), func(r rune) bool {
+		return !unicode.IsLetter(r) && !unicode.IsDigit(r)
+	})
+}
+
+func containsID(ms []memstore.Memory, id int64) bool {
+	for _, m := range ms {
+		if m.Id == id {
+			return true
+		}
+	}
+	return false
+}
+
+// Spec AC3 / card section 4: with the stub embedder on, a query whose tokens
+// are not all present still finds the meaning-matching memory in the top 5;
+// with no embedder the same query finds nothing, because the lexical matcher
+// requires every token.
+func TestSearchFusesVectorRecall(t *testing.T) {
+	const q = "widget calibration procedure notes"
+	// Both rows carry the concept word zeta, which the query does not. A shares
+	// widget, calibration and notes with the query; B shares calibration and
+	// procedure. Neither carries every query token, so neither is a lexical
+	// match.
+	fill := func(s *memstore.Store) int64 {
+		t.Helper()
+		if _, err := s.Put(&memstore.Memory{Kind: "note", Text: "widget calibration zeta notes"}); err != nil {
+			t.Fatalf("Put A: %v", err)
+		}
+		id, err := s.Put(&memstore.Memory{Kind: "note", Text: "calibration procedure zeta handshake"})
+		if err != nil {
+			t.Fatalf("Put B: %v", err)
+		}
+		return id
+	}
+
+	off := openTemp(t)
+	fill(off)
+	if hits, err := off.Search(q, 5); err != nil {
+		t.Fatalf("Search (vectors off): %v", err)
+	} else if len(hits) != 0 {
+		t.Errorf("Search (vectors off) = %d hits, want 0 — no memory carries every query token", len(hits))
+	}
+
+	on := openTemp(t)
+	if err := on.SetEmbedder(stubEmbed(64)); err != nil {
+		t.Fatalf("SetEmbedder: %v", err)
+	}
+	b := fill(on)
+	hits, err := on.Search(q, 5)
+	if err != nil {
+		t.Fatalf("Search (vectors on): %v", err)
+	}
+	if !containsID(hits, b) {
+		t.Errorf("Search (vectors on) = %v, want the meaning-matching memory %d in the top 5", ids(hits), b)
+	}
+}
+
+// Card acceptance 2: with no embedder, record_vec is never created and
+// Search is the lexical order the slice-3 store returned. A store whose
+// embedder is set after every row was written embeds nothing, and its fused
+// search returns the identical order.
+func TestSearchWithoutVectorsIsLexical(t *testing.T) {
+	puts := func(s *memstore.Store) {
+		t.Helper()
+		for _, text := range []string{
+			"the webhook relay retries the queue",
+			"the relay queue backs up under load",
+			"relay and queue notes",
+		} {
+			if _, err := s.Put(&memstore.Memory{Kind: "note", Text: text}); err != nil {
+				t.Fatalf("Put: %v", err)
+			}
+		}
+	}
+
+	none := openTemp(t)
+	puts(none)
+	want, err := none.Search("queue relay", 10)
+	if err != nil {
+		t.Fatalf("Search: %v", err)
+	}
+	if len(want) != 3 {
+		t.Fatalf("Search = %d hits, want 3", len(want))
+	}
+	db, err := sql.Open("sqlite", none.Path())
+	if err != nil {
+		t.Fatalf("sql.Open: %v", err)
+	}
+	var n int
+	if err := db.QueryRow(`SELECT count(*) FROM sqlite_master WHERE name = 'record_vec'`).Scan(&n); err != nil {
+		t.Fatalf("sqlite_master: %v", err)
+	}
+	db.Close()
+	if n != 0 {
+		t.Error("record_vec exists with no embedder configured — the table must be created only by SetEmbedder")
+	}
+
+	late := openTemp(t)
+	puts(late)
+	if err := late.SetEmbedder(stubEmbed(32)); err != nil {
+		t.Fatalf("SetEmbedder: %v", err)
+	}
+	got, err := late.Search("queue relay", 10)
+	if err != nil {
+		t.Fatalf("Search (late embedder): %v", err)
+	}
+	if fmt.Sprint(ids(got)) != fmt.Sprint(ids(want)) {
+		t.Errorf("late-embedder order = %v, want the lexical order %v", ids(got), ids(want))
+	}
+}
+
+// Card acceptance 2: a db that already carries vectors opens fine without an
+// embedder and ignores them — the vector matcher is absent, not an error.
+func TestSearchIgnoresStoredVectorsWithoutEmbedder(t *testing.T) {
+	const q = "widget calibration procedure notes"
+	path := filepath.Join(t.TempDir(), "memory.db")
+	s, err := memstore.Open(path)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	if err := s.SetEmbedder(stubEmbed(64)); err != nil {
+		t.Fatalf("SetEmbedder: %v", err)
+	}
+	b, err := s.Put(&memstore.Memory{Kind: "note", Text: "calibration procedure zeta handshake"})
+	if err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+	if hits, err := s.Search(q, 5); err != nil || !containsID(hits, b) {
+		t.Fatalf("Search with the embedder: hits=%v err=%v, want %d", ids(hits), err, b)
+	}
+	s.Close()
+
+	re, err := memstore.Open(path)
+	if err != nil {
+		t.Fatalf("Open (no embedder): %v", err)
+	}
+	defer re.Close()
+	hits, err := re.Search(q, 5)
+	if err != nil {
+		t.Fatalf("Search (no embedder): %v", err)
+	}
+	if containsID(hits, b) {
+		t.Errorf("Search without an embedder found %d — stored vectors must be ignored, not searched", b)
+	}
+}
+
+// Card acceptance 4: the vector matcher must not demote a lexical bullseye.
+// The exact hit either carries no vector (written before the seam) and ties
+// the vector head — the lexical list wins the tie — or carries one too and
+// outranks the vector-only hit outright.
+func TestSearchVectorDoesNotDemoteExactMatch(t *testing.T) {
+	const q = "widget calibration procedure report"
+
+	pre := openTemp(t)
+	exactPre, err := pre.Put(&memstore.Memory{Kind: "note", Text: q})
+	if err != nil {
+		t.Fatalf("Put exact: %v", err)
+	}
+	if err := pre.SetEmbedder(stubEmbed(64)); err != nil {
+		t.Fatalf("SetEmbedder: %v", err)
+	}
+	if _, err := pre.Put(&memstore.Memory{Kind: "note", Text: "widget calibration zeta"}); err != nil {
+		t.Fatalf("Put vector-only: %v", err)
+	}
+	hits, err := pre.Search(q, 5)
+	if err != nil {
+		t.Fatalf("Search: %v", err)
+	}
+	if len(hits) == 0 || hits[0].Id != exactPre {
+		t.Errorf("Search = %v, want the exact match %d first", ids(hits), exactPre)
+	}
+
+	both := openTemp(t)
+	if err := both.SetEmbedder(stubEmbed(64)); err != nil {
+		t.Fatalf("SetEmbedder: %v", err)
+	}
+	exactBoth, err := both.Put(&memstore.Memory{Kind: "note", Text: q})
+	if err != nil {
+		t.Fatalf("Put exact: %v", err)
+	}
+	if _, err := both.Put(&memstore.Memory{Kind: "note", Text: "widget calibration zeta handshake"}); err != nil {
+		t.Fatalf("Put vector-only: %v", err)
+	}
+	hits, err = both.Search(q, 5)
+	if err != nil {
+		t.Fatalf("Search: %v", err)
+	}
+	if len(hits) == 0 || hits[0].Id != exactBoth {
+		t.Errorf("Search = %v, want the exact match %d first", ids(hits), exactBoth)
+	}
+}
+
+// Card acceptance 5: a Put whose embedding fails rolls back — no memory row
+// and no vector row — and an embedder that returns an empty vector is refused
+// the same way.
+func TestPutEmbeddingFailureWritesNothing(t *testing.T) {
+	s := openTemp(t)
+	if err := s.SetEmbedder(func(text string) ([]float32, error) {
+		if strings.Contains(text, "boom") {
+			return nil, errors.New("no model for that")
+		}
+		return stubEmbed(8)(text)
+	}); err != nil {
+		t.Fatalf("SetEmbedder: %v", err)
+	}
+	if _, err := s.Put(&memstore.Memory{Kind: "note", Text: "this one will boom"}); err == nil {
+		t.Error("Put with a failing embedder: got nil error, want error")
+	}
+	st, err := s.Stats()
+	if err != nil {
+		t.Fatalf("Stats: %v", err)
+	}
+	if st.Total != 0 {
+		t.Errorf("failed Put left %d rows, want 0 — embedding is in the memory's transaction", st.Total)
+	}
+	if st.VectorRows == nil || *st.VectorRows != 0 {
+		t.Errorf("VectorRows = %v, want 0", st.VectorRows)
+	}
+
+	if _, err := s.Put(&memstore.Memory{Kind: "note", Text: "this one is fine"}); err != nil {
+		t.Fatalf("Put after a failed embed: %v", err)
+	}
+
+	empty := openTemp(t)
+	if err := empty.SetEmbedder(func(string) ([]float32, error) { return nil, nil }); err != nil {
+		t.Fatalf("SetEmbedder: %v", err)
+	}
+	if _, err := empty.Put(&memstore.Memory{Kind: "note", Text: "nothing to embed"}); err == nil {
+		t.Error("Put with an empty vector: got nil error, want refusal")
+	}
+}
+
+// Card section 2: the first call pins the dimension, from the file's existing
+// vectors when it has them; a second SetEmbedder is refused and a vector of
+// another width never enters the table.
+func TestSetEmbedderPinsDimension(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "memory.db")
+	s, err := memstore.Open(path)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	if err := s.SetEmbedder(stubEmbed(8)); err != nil {
+		t.Fatalf("SetEmbedder: %v", err)
+	}
+	if _, err := s.Put(&memstore.Memory{Kind: "note", Text: "pins eight dimensions"}); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+	if err := s.SetEmbedder(stubEmbed(8)); err == nil {
+		t.Error("a second SetEmbedder: got nil error, want refusal — the first call pins the dimension")
+	}
+	s.Close()
+
+	re, err := memstore.Open(path)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer re.Close()
+	if err := re.SetEmbedder(stubEmbed(16)); err != nil {
+		t.Fatalf("SetEmbedder on the reopened file: %v", err)
+	}
+	if _, err := re.Put(&memstore.Memory{Kind: "note", Text: "sixteen now"}); err == nil {
+		t.Error("Put under a 16-dim embedder: got nil error, want refusal — the stored vectors are 8-wide")
+	}
+}
+
+// Card section 5: stats report vector coverage only when an embedder is
+// configured — a row written before the seam stays unembedded.
+func TestStatsReportsVectorCoverage(t *testing.T) {
+	s := openTemp(t)
+	if _, err := s.Put(&memstore.Memory{Kind: "note", Text: "written before the embedder"}); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+	st, err := s.Stats()
+	if err != nil {
+		t.Fatalf("Stats: %v", err)
+	}
+	if st.VectorRows != nil {
+		t.Errorf("VectorRows = %d with no embedder, want absent", *st.VectorRows)
+	}
+	if err := s.SetEmbedder(stubEmbed(16)); err != nil {
+		t.Fatalf("SetEmbedder: %v", err)
+	}
+	if _, err := s.Put(&memstore.Memory{Kind: "note", Text: "written after the embedder"}); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+	st, err = s.Stats()
+	if err != nil {
+		t.Fatalf("Stats: %v", err)
+	}
+	if st.VectorRows == nil {
+		t.Fatal("VectorRows = absent with an embedder, want the coverage")
+	}
+	if *st.VectorRows != 1 || st.Total != 2 {
+		t.Errorf("coverage = %d/%d, want 1/2 — the pre-seam row has no vector", *st.VectorRows, st.Total)
+	}
+}
+
+// Card acceptance 6: with an embedder set, every imported row is embedded in
+// the import's own transaction; without one, Import never creates record_vec.
+func TestImportEmbedsWhenConfigured(t *testing.T) {
+	s := openTemp(t)
+	if err := s.SetEmbedder(stubEmbed(32)); err != nil {
+		t.Fatalf("SetEmbedder: %v", err)
+	}
+	src := filepath.Join(t.TempDir(), "fs-events.db")
+	buildFSSource(t, src)
+	imported, _, err := s.Import(src, memstore.ImportOptions{})
+	if err != nil {
+		t.Fatalf("Import: %v", err)
+	}
+	db, err := sql.Open("sqlite", s.Path())
+	if err != nil {
+		t.Fatalf("sql.Open: %v", err)
+	}
+	defer db.Close()
+	var n int
+	if err := db.QueryRow(`SELECT count(*) FROM record_vec`).Scan(&n); err != nil {
+		t.Fatalf("count record_vec: %v", err)
+	}
+	if n != imported {
+		t.Errorf("record_vec rows = %d, want %d — every imported row embeds", n, imported)
+	}
+	var v int
+	if err := db.QueryRow(`SELECT version FROM schema_version`).Scan(&v); err != nil {
+		t.Fatalf("schema_version: %v", err)
+	}
+	if v != 3 {
+		t.Errorf("schema_version = %d with vectors on, want 3 (vectors are an enablement, not a format)", v)
+	}
+
+	plain := openTemp(t)
+	if _, _, err := plain.Import(src, memstore.ImportOptions{}); err != nil {
+		t.Fatalf("Import (no embedder): %v", err)
+	}
+	pdb, err := sql.Open("sqlite", plain.Path())
+	if err != nil {
+		t.Fatalf("sql.Open: %v", err)
+	}
+	defer pdb.Close()
+	if err := pdb.QueryRow(`SELECT count(*) FROM sqlite_master WHERE name = 'record_vec'`).Scan(&n); err != nil {
+		t.Fatalf("sqlite_master: %v", err)
+	}
+	if n != 0 {
+		t.Error("record_vec exists after an import with no embedder")
+	}
+}
+
+// Card acceptance 5: an embedding failure fails the whole import — the
+// transaction rolls back, the good events included.
+func TestImportEmbeddingFailureWritesNothing(t *testing.T) {
+	s := openTemp(t)
+	if err := s.SetEmbedder(func(text string) ([]float32, error) {
+		if strings.Contains(text, "widget") {
+			return nil, errors.New("no model for that")
+		}
+		return stubEmbed(8)(text)
+	}); err != nil {
+		t.Fatalf("SetEmbedder: %v", err)
+	}
+	src := filepath.Join(t.TempDir(), "fs-events.db")
+	buildFSSource(t, src)
+	if _, _, err := s.Import(src, memstore.ImportOptions{}); err == nil {
+		t.Error("Import with a failing embedder: got nil error, want error")
+	}
+	st, err := s.Stats()
+	if err != nil {
+		t.Fatalf("Stats: %v", err)
+	}
+	if st.Total != 0 {
+		t.Errorf("failed import left %d rows, want 0", st.Total)
 	}
 }

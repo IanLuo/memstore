@@ -5,13 +5,16 @@ package memstore
 import (
 	"crypto/sha256"
 	"database/sql"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 	"unicode"
@@ -65,6 +68,12 @@ type Related struct {
 type Store struct {
 	db   *sql.DB
 	path string
+
+	// embed is the optional embedder behind vector recall. Unset, the store
+	// never creates record_vec and Search is purely lexical. dim is the vector
+	// width the embedder is pinned to; 0 until it is known.
+	embed func(text string) ([]float32, error)
+	dim   int
 }
 
 // schemaVersion is the schema_version row's current value: 3, the
@@ -127,6 +136,17 @@ END;
 CREATE TABLE IF NOT EXISTS schema_version (version INTEGER NOT NULL);
 INSERT INTO schema_version(version)
 	SELECT 3 WHERE NOT EXISTS (SELECT 1 FROM schema_version);
+`
+
+// vecSchema is record_vec, the optional projection behind the vector matcher.
+// Only SetEmbedder creates it, so a store with no embedder never has it, and
+// it adds no schema_version: vectors are an enablement, not a format. A row
+// absent from record_vec is simply unembedded; the matcher skips it.
+const vecSchema = `
+CREATE TABLE IF NOT EXISTS record_vec (
+	id     INTEGER PRIMARY KEY REFERENCES memory(id),
+	vector BLOB    NOT NULL
+);
 `
 
 // Open opens the memory file at path, creating it and its parent directory if
@@ -267,7 +287,12 @@ func (s *Store) Put(m *Memory) (int64, error) {
 	}
 	sum := sha256.Sum256([]byte(m.Text))
 
-	res, err := s.db.Exec(`
+	tx, err := s.db.Begin()
+	if err != nil {
+		return 0, fmt.Errorf("memstore: put: %w", err)
+	}
+	defer tx.Rollback()
+	res, err := tx.Exec(`
 		INSERT INTO memory
 			(id, ts, kind, scope, title, text, extra, importance, tier, status,
 			 deleted_at, parent, supersedes, found_by, hash,
@@ -284,6 +309,20 @@ func (s *Store) Put(m *Memory) (int64, error) {
 	if err != nil {
 		return 0, fmt.Errorf("memstore: put: %w", err)
 	}
+	// With an embedder configured the text is embedded in the same
+	// transaction, so an embedding failure leaves no memory behind.
+	if s.embed != nil {
+		v, err := s.embed(m.Text)
+		if err != nil {
+			return 0, fmt.Errorf("memstore: put: embed: %w", err)
+		}
+		if err := s.storeVector(tx, id, v); err != nil {
+			return 0, fmt.Errorf("memstore: put: %w", err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, fmt.Errorf("memstore: put: %w", err)
+	}
 	return id, nil
 }
 
@@ -298,30 +337,32 @@ func (s *Store) Get(id int64) (Memory, error) {
 	return m, nil
 }
 
-// Search returns up to k memories matching q, best first. Matching is lexical
-// (FTS5), bridged by the relation walk: each hit's Related carries the ids its
-// outgoing superseded-by and found-by edges name, so a found memory shows
-// where it sits (the supersedes column rides on Supersedes, as always).
-// Soft-deleted rows are excluded. No match is an empty result, not an error.
+// Search returns up to k memories matching q, best first. Matching is the
+// fused recall of two matchers: lexical (FTS5 bm25 over record_fts) and, when
+// an embedder is configured, vector (cosine over record_vec). Each matcher
+// ranks, the two ranked lists are fused by reciprocal rank fusion, and the
+// relation walk then fills every hit's Related — the outgoing superseded-by
+// and found-by edges — so a found memory shows where it sits (the supersedes
+// column rides on Supersedes, as always). The vector matcher is fail-open on
+// read: if the query will not embed, lexical still answers, with fewer
+// results. Soft-deleted rows are excluded from both matchers. No match is an
+// empty result, not an error.
 func (s *Store) Search(q string, k int) ([]Memory, error) {
 	match := ftsQuery(q)
 	if k <= 0 || match == "" {
 		return nil, nil
 	}
-	rows, err := s.db.Query(`
-		SELECT `+memoryCols+`
-		FROM record_fts
-		JOIN memory ON memory.id = record_fts.rowid
-		WHERE record_fts MATCH ?
-		AND memory.deleted_at IS NULL
-		ORDER BY bm25(record_fts)
-		LIMIT ?`, match, k)
+	lex, err := s.lexicalRank(match, k)
 	if err != nil {
 		return nil, fmt.Errorf("memstore: search: %w", err)
 	}
-	defer rows.Close()
-
-	out, err := scanAll(rows)
+	var vec []int64
+	if s.embed != nil {
+		// Fail-open on read: a query the embedder will not take yields the
+		// lexical results, never an error.
+		vec, _ = s.vectorRank(q, k)
+	}
+	out, err := s.memoriesByID(rrfFuse(lex, vec, k))
 	if err != nil {
 		return nil, fmt.Errorf("memstore: search: %w", err)
 	}
@@ -333,6 +374,284 @@ func (s *Store) Search(q string, k int) ([]Memory, error) {
 		out[i].Related = rel
 	}
 	return out, nil
+}
+
+// lexicalRank ranks up to k live memories by FTS5 bm25, best first.
+func (s *Store) lexicalRank(match string, k int) ([]int64, error) {
+	rows, err := s.db.Query(`
+		SELECT memory.id
+		FROM record_fts
+		JOIN memory ON memory.id = record_fts.rowid
+		WHERE record_fts MATCH ?
+		AND memory.deleted_at IS NULL
+		ORDER BY bm25(record_fts)
+		LIMIT ?`, match, k)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var ids []int64
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		ids = append(ids, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return ids, nil
+}
+
+// vectorRank ranks up to k live memories by cosine against the query's
+// embedding, best first. A row whose vector width differs from the query's is
+// skipped, never compared across widths, and a row with no shared direction
+// (cosine <= 0) is not a match. The query is embedded once per search, not
+// once per row.
+func (s *Store) vectorRank(q string, k int) ([]int64, error) {
+	qv, err := s.embed(q)
+	if err != nil {
+		return nil, err
+	}
+	if len(qv) == 0 {
+		return nil, errors.New("memstore: search: embedder returned an empty query vector")
+	}
+	rows, err := s.db.Query(`
+		SELECT record_vec.id, record_vec.vector
+		FROM record_vec
+		JOIN memory ON memory.id = record_vec.id
+		WHERE memory.deleted_at IS NULL`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	type scored struct {
+		id    int64
+		score float64
+	}
+	var out []scored
+	for rows.Next() {
+		var id int64
+		var blob []byte
+		if err := rows.Scan(&id, &blob); err != nil {
+			return nil, err
+		}
+		v := vecFromBytes(blob)
+		if len(v) != len(qv) {
+			continue
+		}
+		if c := cosine(qv, v); c > 0 {
+			out = append(out, scored{id, c})
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].score != out[j].score {
+			return out[i].score > out[j].score
+		}
+		return out[i].id < out[j].id
+	})
+	if len(out) > k {
+		out = out[:k]
+	}
+	ids := make([]int64, len(out))
+	for i, x := range out {
+		ids[i] = x.id
+	}
+	return ids, nil
+}
+
+// rrfK is the reciprocal-rank-fusion constant: score(d) = sum 1/(rrfK+rank).
+// 60 is the value the RRF paper uses; it needs no score calibration and is
+// the one knob, fixed, not per-query.
+const rrfK = 60
+
+// rrfFuse merges the lexical and vector ranked lists into one order by
+// reciprocal rank fusion, at most k ids. A tie in fused score breaks to the
+// better rank, then to the lexical list, then to the lower id — so a vector
+// hit that merely ties the lexical head never displaces it, and the order is
+// deterministic. With an empty vector list the fused order is exactly the
+// lexical order.
+func rrfFuse(lex, vec []int64, k int) []int64 {
+	type entry struct {
+		score    float64
+		bestRank int
+		lexical  bool
+	}
+	e := map[int64]*entry{}
+	add := func(ids []int64, lexical bool) {
+		for i, id := range ids {
+			rank := i + 1
+			x, ok := e[id]
+			if !ok {
+				x = &entry{bestRank: rank, lexical: lexical}
+				e[id] = x
+			}
+			if rank < x.bestRank {
+				x.bestRank = rank
+			}
+			if lexical {
+				x.lexical = true
+			}
+			x.score += 1 / float64(rrfK+rank)
+		}
+	}
+	add(lex, true)
+	add(vec, false)
+
+	out := make([]int64, 0, len(e))
+	for id := range e {
+		out = append(out, id)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		a, b := e[out[i]], e[out[j]]
+		if a.score != b.score {
+			return a.score > b.score
+		}
+		if a.bestRank != b.bestRank {
+			return a.bestRank < b.bestRank
+		}
+		if a.lexical != b.lexical {
+			return a.lexical
+		}
+		return out[i] < out[j]
+	})
+	if len(out) > k {
+		out = out[:k]
+	}
+	return out
+}
+
+// memoriesByID loads the memories named by ids, in that order, dropping any
+// id no longer present. Search uses it to materialise its fused order after
+// the matchers ranked ids.
+func (s *Store) memoriesByID(ids []int64) ([]Memory, error) {
+	if len(ids) == 0 {
+		return nil, nil
+	}
+	ph := make([]string, len(ids))
+	args := make([]any, len(ids))
+	for i, id := range ids {
+		ph[i] = "?"
+		args[i] = id
+	}
+	rows, err := s.db.Query(`SELECT `+memoryCols+` FROM memory WHERE id IN (`+strings.Join(ph, ",")+`)`, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	byID := map[int64]Memory{}
+	for rows.Next() {
+		m, err := scanMemory(rows)
+		if err != nil {
+			return nil, err
+		}
+		byID[m.Id] = m
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	out := make([]Memory, 0, len(ids))
+	for _, id := range ids {
+		if m, ok := byID[id]; ok {
+			out = append(out, m)
+		}
+	}
+	return out, nil
+}
+
+// SetEmbedder registers the embedder behind vector recall. It is a post-Open
+// setter: a store with no embedder never creates record_vec and searches
+// lexically. The first call pins the dimension — from a vector the file
+// already carries, or from the first text embedded — and creates record_vec
+// if it is missing; a later call is refused, so the dimension cannot change
+// under rows already stored. A nil embedder is refused. Rows written before
+// the call stay unembedded; the vector matcher skips them.
+func (s *Store) SetEmbedder(embed func(text string) ([]float32, error)) error {
+	if embed == nil {
+		return errors.New("memstore: SetEmbedder: nil embedder")
+	}
+	if s.embed != nil {
+		return errors.New("memstore: SetEmbedder: embedder already set; the first call pins the dimension")
+	}
+	if _, err := s.db.Exec(vecSchema); err != nil {
+		return fmt.Errorf("memstore: SetEmbedder: %w", err)
+	}
+	// A file that already carries vectors pins their width, so an embedder of
+	// another width cannot be mixed into the same table.
+	var n int
+	err := s.db.QueryRow(`SELECT length(vector) FROM record_vec LIMIT 1`).Scan(&n)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return fmt.Errorf("memstore: SetEmbedder: %w", err)
+	}
+	s.embed = embed
+	if n > 0 && n%4 == 0 {
+		s.dim = n / 4
+	}
+	return nil
+}
+
+// storeVector writes one row's vector, pinned to the store's dimension. The
+// first vector seen pins the dimension; a later vector of another width is
+// refused, never truncated.
+func (s *Store) storeVector(tx *sql.Tx, id int64, v []float32) error {
+	if len(v) == 0 {
+		return errors.New("embedder returned an empty vector")
+	}
+	if s.dim == 0 {
+		s.dim = len(v)
+	} else if len(v) != s.dim {
+		return fmt.Errorf("embedder returned a %d-dimension vector, want %d", len(v), s.dim)
+	}
+	if _, err := tx.Exec(`INSERT INTO record_vec (id, vector) VALUES (?, ?)`, id, vecToBytes(v)); err != nil {
+		return err
+	}
+	return nil
+}
+
+// vecToBytes and vecFromBytes carry a float32 vector as little-endian bytes,
+// the shape record_vec stores; a length that is not a whole number of
+// float32s reads back nil, never a torn value.
+func vecToBytes(v []float32) []byte {
+	b := make([]byte, 4*len(v))
+	for i, f := range v {
+		binary.LittleEndian.PutUint32(b[i*4:], math.Float32bits(f))
+	}
+	return b
+}
+
+func vecFromBytes(b []byte) []float32 {
+	if len(b)%4 != 0 {
+		return nil
+	}
+	v := make([]float32, len(b)/4)
+	for i := range v {
+		v[i] = math.Float32frombits(binary.LittleEndian.Uint32(b[i*4:]))
+	}
+	return v
+}
+
+// cosine is the cosine similarity of two equal-length vectors; a mismatched
+// length or a zero norm scores 0, never NaN.
+func cosine(a, b []float32) float64 {
+	if len(a) != len(b) || len(a) == 0 {
+		return 0
+	}
+	var dot, na, nb float64
+	for i := range a {
+		x, y := float64(a[i]), float64(b[i])
+		dot += x * y
+		na += x * x
+		nb += y * y
+	}
+	if na == 0 || nb == 0 {
+		return 0
+	}
+	return dot / (math.Sqrt(na) * math.Sqrt(nb))
 }
 
 // CloseMemory retires one memory: status becomes closed, and Close is the
@@ -560,6 +879,17 @@ func (s *Store) Import(srcStorePath string, _ ImportOptions) (imported, skipped 
 		if err != nil {
 			return 0, 0, fmt.Errorf("memstore: import from %s: event %s: %w", srcStorePath, eventID, err)
 		}
+		// With an embedder configured the row embeds in this same transaction;
+		// an embedding failure rolls the whole import back.
+		if s.embed != nil {
+			v, err := s.embed(text)
+			if err != nil {
+				return 0, 0, fmt.Errorf("memstore: import from %s: event %s: embed: %w", srcStorePath, eventID, err)
+			}
+			if err := s.storeVector(tx, local, v); err != nil {
+				return 0, 0, fmt.Errorf("memstore: import from %s: event %s: %w", srcStorePath, eventID, err)
+			}
+		}
 		if node.Valid && node.String != "" {
 			if _, ok := nodeID[node.String]; !ok {
 				nodeID[node.String] = local
@@ -708,6 +1038,10 @@ type Stats struct {
 	WalBytes  int64
 	Newest    *time.Time
 	Oldest    *time.Time
+
+	// VectorRows is how many rows carry a vector; nil when no embedder is
+	// configured, so the coverage (VectorRows/Total) is absent, not zero.
+	VectorRows *int64 `json:"VectorRows,omitempty"`
 }
 
 // Stats returns the store's shape; it writes nothing.
@@ -730,6 +1064,13 @@ func (s *Store) Stats() (Stats, error) {
 		return st, fmt.Errorf("memstore: stats: %w", err)
 	}
 	st.Newest, st.Oldest = unixTime(newest), unixTime(oldest)
+	if s.embed != nil {
+		var n int64
+		if err := s.db.QueryRow(`SELECT count(*) FROM record_vec`).Scan(&n); err != nil {
+			return st, fmt.Errorf("memstore: stats: %w", err)
+		}
+		st.VectorRows = &n
+	}
 	return st, nil
 }
 
