@@ -70,10 +70,10 @@ type Store struct {
 // schemaVersion is the schema_version row's current value: 3, the
 // unix-nanosecond timestamp format plus the provenance columns of slice 3.
 // Version 2 (the same timestamps, no provenance) is the previous format and
-// is upgraded on Open; version 1 (unix seconds) existed only in the
-// unversioned first release; a file stamped with anything else is refused on
-// Open, never silently migrated or misread. Keep the INSERT literal in schema
-// equal to this; TestSchemaVersion pins both.
+// is upgraded on Open; version 1 (unix seconds, written by the first slice
+// release, 5aa287a) is refused, never misread; a file stamped with anything
+// else is refused on Open, never silently migrated or misread. Keep the INSERT
+// literal in schema equal to this; TestSchemaVersion pins both.
 const schemaVersion = 3
 
 // schema is the whole database. record_fts is FTS5 external content over
