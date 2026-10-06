@@ -77,8 +77,9 @@ func TestMatchersOwnsRanking(t *testing.T) {
 	}
 }
 
-// Card acceptance 2: Matchers holds no write path. Its only handle is the
-// read interface, so its source must name no write statement or write call.
+// Card acceptance 2 (as amended): matchers.go performs no writes. Its only
+// handle is a query handle — write-capable, which is why the claim is pinned
+// by its source, and why the wording says performs, not cannot.
 func TestMatchersHasNoWritePath(t *testing.T) {
 	src := readSource(t, "matchers.go")
 	for _, banned := range []string{"Exec(", "CREATE TABLE", "INSERT INTO", "UPDATE ", "DELETE FROM"} {

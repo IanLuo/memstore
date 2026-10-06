@@ -9,9 +9,9 @@ import (
 	"strings"
 )
 
-// matchReader is the read-only handle the matchers rank the store through: it
-// runs one query, and it carries no Exec, no transaction and no schema method,
-// so a Matchers holds no write path. *Store implements it.
+// matchReader is the query handle the matchers rank the store through: *Store
+// implements it with db.Query, which is write-capable. The guarantee this
+// surface actually carries is the pinned one — matchers.go performs no writes.
 type matchReader interface {
 	readRows(query string, args ...any) (*sql.Rows, error)
 }
@@ -19,8 +19,9 @@ type matchReader interface {
 // Matchers owns recall: it ranks live memories lexically (FTS5 bm25) and, when
 // an embedder is configured, by vector (cosine over record_vec), fuses the two
 // lists by reciprocal rank fusion, and fills each hit with the relations a
-// found memory shows. It reads through matchReader and holds no write path;
-// the store keeps persistence and the lifecycle verbs.
+// found memory shows. It reads through matchReader; matchers.go performs no
+// writes (pinned by TestMatchersHasNoWritePath). The store keeps persistence
+// and the lifecycle verbs.
 type Matchers struct {
 	reader   matchReader
 	embedder func(text string) ([]float32, error)
