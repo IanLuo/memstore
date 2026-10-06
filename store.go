@@ -6,8 +6,10 @@ import (
 	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -18,10 +20,11 @@ import (
 )
 
 // Memory is one row of the memory table, the store's only source of truth.
-// Id..Hash are content and are written once; Status, DeletedAt and Tier are
-// lifecycle columns and are the only fields Put may change later. Related is
-// not a column at all: Search fills it, from the edge table, when the row is
-// a search hit; the other verbs leave it nil.
+// Id..Hash plus the provenance columns Origin..FsNode are content, written
+// once; Status, DeletedAt and Tier are lifecycle columns and are the only
+// fields Put may change later. Related is not a column at all: Search fills
+// it, from the edge table, when the row is a search hit; the other verbs
+// leave it nil.
 type Memory struct {
 	Id         int64
 	Ts         time.Time
@@ -38,7 +41,15 @@ type Memory struct {
 	Supersedes *int64
 	FoundBy    string
 	Hash       string
-	Related    []Related
+
+	// Provenance — where this row came from. A native row is 'native' with
+	// the rest empty; Import is the only writer of any other shape.
+	Origin   string
+	OriginId string
+	Ref      string
+	FsNode   string
+
+	Related []Related
 }
 
 // Related is one memory another memory points at: the target of an outgoing
@@ -56,12 +67,14 @@ type Store struct {
 	path string
 }
 
-// schemaVersion is the schema_version row's current value: 2, the
-// unix-nanosecond timestamp format. Version 1 (unix seconds) existed only in
-// the unversioned first release; a file stamped with anything else is refused
-// on Open, never silently migrated or misread. Keep the INSERT literal in
-// schema equal to this; TestSchemaVersion pins both.
-const schemaVersion = 2
+// schemaVersion is the schema_version row's current value: 3, the
+// unix-nanosecond timestamp format plus the provenance columns of slice 3.
+// Version 2 (the same timestamps, no provenance) is the previous format and
+// is upgraded on Open; version 1 (unix seconds) existed only in the
+// unversioned first release; a file stamped with anything else is refused on
+// Open, never silently migrated or misread. Keep the INSERT literal in schema
+// equal to this; TestSchemaVersion pins both.
+const schemaVersion = 3
 
 // schema is the whole database. record_fts is FTS5 external content over
 // memory (title, text): the text is indexed in place, never copied. Only an
@@ -94,7 +107,11 @@ CREATE TABLE IF NOT EXISTS memory (
 	parent     INTEGER,
 	supersedes INTEGER,
 	found_by   TEXT NOT NULL DEFAULT '',
-	hash       TEXT NOT NULL
+	hash       TEXT NOT NULL,
+	origin     TEXT NOT NULL DEFAULT 'native',
+	origin_id  TEXT,
+	ref        TEXT,
+	fs_node    TEXT
 );
 
 CREATE VIRTUAL TABLE IF NOT EXISTS record_fts USING fts5(
@@ -109,7 +126,7 @@ END;
 
 CREATE TABLE IF NOT EXISTS schema_version (version INTEGER NOT NULL);
 INSERT INTO schema_version(version)
-	SELECT 2 WHERE NOT EXISTS (SELECT 1 FROM schema_version);
+	SELECT 3 WHERE NOT EXISTS (SELECT 1 FROM schema_version);
 `
 
 // Open opens the memory file at path, creating it and its parent directory if
@@ -129,9 +146,10 @@ func Open(path string) (*Store, error) {
 	// racing two connections into SQLITE_BUSY.
 	db.SetMaxOpenConns(1)
 	// Refuse a file stamped with a schema_version we do not expect before
-	// anything touches it — no WAL, no schema write, no chmod. A version-1 file
-	// stores ts in seconds, not nanoseconds, and reading it as current would
-	// silently show 1970.
+	// anything touches it — no WAL, no schema write, no chmod. The recognized
+	// versions are 2 (the previous format, upgraded below) and the current one;
+	// a version-1 file stores ts in seconds, not nanoseconds, and reading it as
+	// current would silently show 1970.
 	var stamped int
 	if err := db.QueryRow(`SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'schema_version'`).Scan(&stamped); err != nil {
 		db.Close()
@@ -143,7 +161,7 @@ func Open(path string) (*Store, error) {
 			db.Close()
 			return nil, fmt.Errorf("memstore: read schema_version from %s: %w", path, err)
 		}
-		if v != schemaVersion {
+		if v != 2 && v != schemaVersion {
 			db.Close()
 			return nil, fmt.Errorf("memstore: open %s: schema_version is %d, want %d (unix-nanosecond timestamps)", path, v, schemaVersion)
 		}
@@ -155,6 +173,38 @@ func Open(path string) (*Store, error) {
 	if _, err := db.Exec(schema); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("memstore: apply schema to %s: %w", path, err)
+	}
+	// A file stamped schema_version 2 predates the provenance columns. The
+	// upgrade is additive, guarded step by step by what already exists, so it
+	// is safe to run at every Open: the missing columns are added with their v3
+	// definition, the fs_node index is created, and the version row moves to 3.
+	// Existing rows are untouched — their origin picks up the column's default
+	// 'native'.
+	for _, add := range []struct{ col, ddl string }{
+		{"origin", "TEXT NOT NULL DEFAULT 'native'"},
+		{"origin_id", "TEXT"},
+		{"ref", "TEXT"},
+		{"fs_node", "TEXT"},
+	} {
+		var have int
+		if err := db.QueryRow(`SELECT count(*) FROM pragma_table_info('memory') WHERE name = ?`, add.col).Scan(&have); err != nil {
+			db.Close()
+			return nil, fmt.Errorf("memstore: upgrade %s: %w", path, err)
+		}
+		if have == 0 {
+			if _, err := db.Exec(`ALTER TABLE memory ADD COLUMN ` + add.col + ` ` + add.ddl); err != nil {
+				db.Close()
+				return nil, fmt.Errorf("memstore: upgrade %s: %w", path, err)
+			}
+		}
+	}
+	if _, err := db.Exec(`CREATE INDEX IF NOT EXISTS idx_memory_fs_node ON memory(fs_node)`); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("memstore: upgrade %s: %w", path, err)
+	}
+	if _, err := db.Exec(`UPDATE schema_version SET version = ? WHERE version = 2`, schemaVersion); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("memstore: upgrade %s: %w", path, err)
 	}
 	// The store is user-only: the file and its WAL sidecars hold memory text,
 	// and sqlite creates them under the umask, which may let group or other
@@ -191,7 +241,9 @@ func (s *Store) Close() error { return s.db.Close() }
 // Put appends one memory and returns its id. Text and kind are required; an
 // explicit nonzero id is honoured only if it is free. Content is never
 // updated, so a second Put of an existing id is refused. A caller-supplied
-// DeletedAt is refused: deletion is forget's job, the one writer of that state.
+// DeletedAt is refused: deletion is forget's job, the one writer of that
+// state — and provenance is import's, so a Put always writes origin 'native'
+// with the rest empty, whatever the caller's struct carried.
 func (s *Store) Put(m *Memory) (int64, error) {
 	if m.Text == "" {
 		return 0, errors.New("memstore: put: text is empty")
@@ -218,11 +270,13 @@ func (s *Store) Put(m *Memory) (int64, error) {
 	res, err := s.db.Exec(`
 		INSERT INTO memory
 			(id, ts, kind, scope, title, text, extra, importance, tier, status,
-			 deleted_at, parent, supersedes, found_by, hash)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			 deleted_at, parent, supersedes, found_by, hash,
+			 origin, origin_id, ref, fs_node)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		nullableId(m.Id), ts.UnixNano(), m.Kind, m.Scope, m.Title, m.Text, m.Extra,
 		m.Importance, m.Tier, status, nil, m.Parent,
-		m.Supersedes, m.FoundBy, hex.EncodeToString(sum[:]))
+		m.Supersedes, m.FoundBy, hex.EncodeToString(sum[:]),
+		"native", nil, nil, nil)
 	if err != nil {
 		return 0, fmt.Errorf("memstore: put: %w", err)
 	}
@@ -372,6 +426,243 @@ func (s *Store) Recent(scope string, k int) ([]Memory, error) {
 	return out, nil
 }
 
+// ImportOptions carries the knobs an import can be turned with — none today;
+// the parameter exists so a later option (a scope filter, a stop-at-ts) is
+// additive and does not change callers.
+type ImportOptions struct{}
+
+// Import copies every event of an fs-style store (a database with an events
+// table) into this one, in one transaction: one memory row per event, with
+// the kind mapping and the provenance columns filled. It is one-way — a row
+// that already carries (origin, origin_id) is skipped, never re-created or
+// updated, and nothing else in this store is touched. A source it cannot read
+// or an event it cannot map fails the whole import: the transaction rolls
+// back and nothing is written. It returns the number of events imported and
+// the number skipped as already present.
+//
+// The source is never opened in place: SQLite writes -shm/-wal sidecars
+// beside any WAL-mode database it opens, read-only mode included, so opening
+// ~/.fs/store.db would write into the other store's directory. Import
+// snapshots the file (and its -wal, when hot) to a temp copy and reads that.
+func (s *Store) Import(srcStorePath string, _ ImportOptions) (imported, skipped int, err error) {
+	dir, err := os.MkdirTemp("", "memstore-import-")
+	if err != nil {
+		return 0, 0, fmt.Errorf("memstore: import from %s: %w", srcStorePath, err)
+	}
+	defer os.RemoveAll(dir)
+	srcPath := filepath.Join(dir, "source.db")
+	if err := copyFile(srcPath, srcStorePath); err != nil {
+		return 0, 0, fmt.Errorf("memstore: import from %s: %w", srcStorePath, err)
+	}
+	if _, err := os.Stat(srcStorePath + "-wal"); err == nil {
+		if err := copyFile(srcPath+"-wal", srcStorePath+"-wal"); err != nil {
+			return 0, 0, fmt.Errorf("memstore: import from %s: %w", srcStorePath, err)
+		}
+	}
+
+	src, err := sql.Open("sqlite", srcPath)
+	if err != nil {
+		return 0, 0, fmt.Errorf("memstore: import from %s: %w", srcStorePath, err)
+	}
+	defer src.Close()
+	src.SetMaxOpenConns(1)
+
+	// nodeID maps each fs node to the local id of its earliest imported row —
+	// rows of earlier runs included, so a child of a node imported before still
+	// resolves (import is resumable). Native rows can never be parents: their
+	// fs_node is NULL, and the map reads only origin = 'imported'.
+	nodeID := map[string]int64{}
+	{
+		have, err := s.db.Query(`SELECT fs_node, id FROM memory WHERE origin = 'imported' AND fs_node IS NOT NULL ORDER BY ts, id`)
+		if err != nil {
+			return 0, 0, fmt.Errorf("memstore: import: %w", err)
+		}
+		for have.Next() {
+			var node string
+			var id int64
+			if err := have.Scan(&node, &id); err != nil {
+				have.Close()
+				return 0, 0, fmt.Errorf("memstore: import: %w", err)
+			}
+			if _, ok := nodeID[node]; !ok {
+				nodeID[node] = id
+			}
+		}
+		have.Close()
+		if err := have.Err(); err != nil {
+			return 0, 0, fmt.Errorf("memstore: import: %w", err)
+		}
+	}
+
+	tx, err := s.db.Begin()
+	if err != nil {
+		return 0, 0, fmt.Errorf("memstore: import: %w", err)
+	}
+	defer tx.Rollback()
+
+	// Events in timestamp order, so within a node the first row seen is the
+	// earliest — the row a parent link resolves to.
+	events, err := src.Query(`SELECT id, timestamp, project_id, node_id, parent_node_id, type, payload, commit_sha
+		FROM events ORDER BY timestamp, id`)
+	if err != nil {
+		return 0, 0, fmt.Errorf("memstore: import from %s: %w", srcStorePath, err)
+	}
+	defer events.Close()
+
+	type pendingParent struct {
+		id     int64
+		parent string
+	}
+	var pend []pendingParent
+
+	for events.Next() {
+		var (
+			eventID, ts, project, eventType, payload string
+			node, parentNode, commit                 sql.NullString
+		)
+		if err := events.Scan(&eventID, &ts, &project, &node, &parentNode, &eventType, &payload, &commit); err != nil {
+			return 0, 0, fmt.Errorf("memstore: import from %s: %w", srcStorePath, err)
+		}
+		var already bool
+		if err := tx.QueryRow(`SELECT EXISTS (SELECT 1 FROM memory WHERE origin = 'imported' AND origin_id = ?)`, eventID).Scan(&already); err != nil {
+			return 0, 0, fmt.Errorf("memstore: import: %w", err)
+		}
+		if already {
+			skipped++
+			continue
+		}
+
+		t, err := time.Parse(time.RFC3339Nano, ts)
+		if err != nil {
+			return 0, 0, fmt.Errorf("memstore: import from %s: event %s: %w", srcStorePath, eventID, err)
+		}
+		if t.Before(tsMin) || t.After(tsMax) {
+			return 0, 0, fmt.Errorf("memstore: import from %s: event %s: ts %s outside %s..%s", srcStorePath, eventID, t, tsMin, tsMax)
+		}
+		kind := fsTypeToKind[eventType]
+		if kind == "" {
+			kind = eventType
+		}
+		title, text, extra := importPayload(payload, eventType)
+		sum := sha256.Sum256([]byte(text))
+		res, err := tx.Exec(`
+			INSERT INTO memory
+				(id, ts, kind, scope, title, text, extra, importance, tier, status,
+				 deleted_at, parent, supersedes, found_by, hash,
+				 origin, origin_id, ref, fs_node)
+			VALUES (?, ?, ?, ?, ?, ?, ?, 0, '', 'open', NULL, NULL, NULL, '', ?, ?, ?, ?, ?)`,
+			nil, t.UnixNano(), kind, project, title, text, extra,
+			hex.EncodeToString(sum[:]), "imported", eventID, commit, node)
+		if err != nil {
+			return 0, 0, fmt.Errorf("memstore: import from %s: event %s: %w", srcStorePath, eventID, err)
+		}
+		local, err := res.LastInsertId()
+		if err != nil {
+			return 0, 0, fmt.Errorf("memstore: import from %s: event %s: %w", srcStorePath, eventID, err)
+		}
+		if node.Valid && node.String != "" {
+			if _, ok := nodeID[node.String]; !ok {
+				nodeID[node.String] = local
+			}
+		}
+		if parentNode.Valid && parentNode.String != "" {
+			pend = append(pend, pendingParent{local, parentNode.String})
+		}
+		imported++
+	}
+	if err := events.Err(); err != nil {
+		return 0, 0, fmt.Errorf("memstore: import from %s: %w", srcStorePath, err)
+	}
+
+	// Parents resolve after every insert, so a parent later in the file links;
+	// a parent_node_id that names no imported row (now or in an earlier run)
+	// stays NULL and does not fail the import.
+	for _, p := range pend {
+		pid, ok := nodeID[p.parent]
+		if !ok {
+			continue
+		}
+		if _, err := tx.Exec(`UPDATE memory SET parent = ? WHERE id = ?`, pid, p.id); err != nil {
+			return 0, 0, fmt.Errorf("memstore: import: %w", err)
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		return 0, 0, fmt.Errorf("memstore: import: %w", err)
+	}
+	return imported, skipped, nil
+}
+
+// fsTypeToKind maps the fs event types the card names to memory kinds; a type
+// the table does not name keeps its fs name (kinds are open labelled).
+var fsTypeToKind = map[string]string{
+	"decision-recorded": "decision",
+	"knowledge-added":   "knowledge",
+	"task-created":      "task",
+	"report-recorded":   "report",
+	"plan-recorded":     "plan",
+	"delivery-recorded": "event",
+	"status-changed":    "event",
+}
+
+// payloadTextOrder is the order title and text take the payload's text-ish
+// field in: first present wins.
+var payloadTextOrder = []string{"goal", "summary", "line", "body"}
+
+// importPayload splits an event's payload into title, text and extra. title
+// and text both take the first present text-ish field (trimmed); with none,
+// title falls back to the event type and text to the raw payload. extra is
+// whatever of the payload remains once the taken field is set aside — a
+// payload whose text is the whole payload has no remainder.
+func importPayload(payload, eventType string) (title, text, extra string) {
+	raw := strings.TrimSpace(payload)
+	var obj map[string]json.RawMessage
+	if json.Unmarshal([]byte(raw), &obj) == nil {
+		for _, k := range payloadTextOrder {
+			rawv, ok := obj[k]
+			if !ok {
+				continue
+			}
+			var v string
+			if err := json.Unmarshal(rawv, &v); err != nil {
+				continue
+			}
+			if v = strings.TrimSpace(v); v == "" {
+				continue
+			}
+			title, text = v, v
+			delete(obj, k)
+			if len(obj) > 0 {
+				if rest, err := json.Marshal(obj); err == nil {
+					extra = string(rest)
+				}
+			}
+			return title, text, extra
+		}
+	}
+	return eventType, raw, ""
+}
+
+// copyFile copies one file's bytes to another; a copy that fails halfway
+// leaves no destination behind.
+func copyFile(dst, src string) error {
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+	out, err := os.Create(dst)
+	if err != nil {
+		return err
+	}
+	if _, err := io.Copy(out, in); err != nil {
+		out.Close()
+		os.Remove(dst)
+		return err
+	}
+	return out.Close()
+}
+
 // scanAll reads every Memory a query's rows carry; the caller closes rows.
 func scanAll(rows *sql.Rows) ([]Memory, error) {
 	var out []Memory
@@ -495,7 +786,8 @@ func unixTime(v sql.NullInt64) *time.Time {
 // memoryCols is the full column list, in the order scanMemory reads it.
 const memoryCols = `memory.id, memory.ts, memory.kind, memory.scope, memory.title,
 	memory.text, memory.extra, memory.importance, memory.tier, memory.status,
-	memory.deleted_at, memory.parent, memory.supersedes, memory.found_by, memory.hash`
+	memory.deleted_at, memory.parent, memory.supersedes, memory.found_by, memory.hash,
+	memory.origin, memory.origin_id, memory.ref, memory.fs_node`
 
 // scanner is satisfied by *sql.Row and *sql.Rows, so one reader serves Get and
 // Search.
@@ -510,10 +802,13 @@ func scanMemory(sc scanner) (Memory, error) {
 		deletedAt  sql.NullInt64
 		parent     sql.NullInt64
 		supersedes sql.NullInt64
+		originID   sql.NullString
+		ref        sql.NullString
+		fsNode     sql.NullString
 	)
 	if err := sc.Scan(&m.Id, &ts, &m.Kind, &m.Scope, &m.Title, &m.Text, &m.Extra,
 		&m.Importance, &m.Tier, &m.Status, &deletedAt, &parent, &supersedes,
-		&m.FoundBy, &m.Hash); err != nil {
+		&m.FoundBy, &m.Hash, &m.Origin, &originID, &ref, &fsNode); err != nil {
 		return Memory{}, err
 	}
 	m.Ts = time.Unix(0, ts).UTC()
@@ -529,6 +824,9 @@ func scanMemory(sc scanner) (Memory, error) {
 		v := supersedes.Int64
 		m.Supersedes = &v
 	}
+	m.OriginId = originID.String
+	m.Ref = ref.String
+	m.FsNode = fsNode.String
 	return m, nil
 }
 

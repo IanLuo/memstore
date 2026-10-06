@@ -196,8 +196,8 @@ func TestSecondPutSameIdRefused(t *testing.T) {
 	}
 }
 
-// Card section 1 / A1: a fresh store records schema_version 2 — the
-// unix-nanosecond timestamp format — and opens.
+// Card section 1 / A1: a fresh store records schema_version 3 — the
+// unix-nanosecond timestamp format with the provenance columns — and opens.
 func TestSchemaVersion(t *testing.T) {
 	s := openTemp(t)
 	db, err := sql.Open("sqlite", s.Path())
@@ -210,8 +210,8 @@ func TestSchemaVersion(t *testing.T) {
 	if err != nil {
 		t.Fatalf("SELECT schema_version: %v", err)
 	}
-	if v != 2 {
-		t.Errorf("schema_version = %d, want 2", v)
+	if v != 3 {
+		t.Errorf("schema_version = %d, want 3", v)
 	}
 }
 
@@ -220,7 +220,9 @@ func TestSchemaVersion(t *testing.T) {
 // were the current format. Each stamp gets its own fresh file so a refused
 // file never backs a later stage.
 func TestOpenRefusesUnexpectedSchemaVersion(t *testing.T) {
-	for _, stamp := range []int{1, 3} {
+	// 2 is recognized (upgraded) and 3 is current, so stamps 1 and 4 are the
+	// versions Open must refuse.
+	for _, stamp := range []int{1, 4} {
 		path := filepath.Join(t.TempDir(), "memory.db")
 		// A fresh store records the current version; stamp the row over.
 		s, err := memstore.Open(path)
@@ -844,5 +846,400 @@ func TestStorePermissionsUserOnly(t *testing.T) {
 	}
 	if got := di.Mode().Perm(); got != 0o700 {
 		t.Errorf("db dir mode = %o, want 700", got)
+	}
+}
+
+// Card 3 §1: a native Put writes origin 'native' and leaves the rest of the
+// provenance NULL — nothing the native path carries appears in the row.
+func TestPutWritesNativeProvenance(t *testing.T) {
+	s := openTemp(t)
+	id, err := s.Put(&memstore.Memory{Kind: "note", Text: "a native memory"})
+	if err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+	got, err := s.Get(id)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if got.Origin != "native" {
+		t.Errorf("Origin = %q, want native", got.Origin)
+	}
+	if got.OriginId != "" || got.Ref != "" || got.FsNode != "" {
+		t.Errorf("native provenance = %q/%q/%q, want all empty", got.OriginId, got.Ref, got.FsNode)
+	}
+	db, err := sql.Open("sqlite", s.Path())
+	if err != nil {
+		t.Fatalf("sql.Open: %v", err)
+	}
+	defer db.Close()
+	var origin string
+	var originID, ref, fsNode sql.NullString
+	if err := db.QueryRow(`SELECT origin, origin_id, ref, fs_node FROM memory WHERE id = ?`, id).Scan(&origin, &originID, &ref, &fsNode); err != nil {
+		t.Fatalf("SELECT provenance: %v", err)
+	}
+	if origin != "native" || originID.Valid || ref.Valid || fsNode.Valid {
+		t.Errorf("row provenance = %q %v %v %v, want 'native' and three NULLs", origin, originID, ref, fsNode)
+	}
+}
+
+// Card 3 §1 / A1: a database stamped schema_version 2 — the previous format —
+// is upgraded on open, never refused: its rows stay readable, the missing
+// columns land with their v3 definitions, and the version row reads 3. The
+// fixture is a genuine v2 file: the memory table is downgraded (the fs_node
+// index first, as SQLite requires) and the version row stamped back. A stamp
+// no longer recognized still refuses, as TestOpenRefusesUnexpectedSchemaVersion
+// proves.
+func TestV2StoreOpensAndUpgrades(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "v2.db")
+	s, err := memstore.Open(path)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	oldID, err := s.Put(&memstore.Memory{Kind: "note", Text: "content born at v2"})
+	if err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+	s.Close()
+
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatalf("sql.Open: %v", err)
+	}
+	for _, stmt := range []string{
+		`DROP INDEX IF EXISTS idx_memory_fs_node`,
+		`ALTER TABLE memory DROP COLUMN origin`,
+		`ALTER TABLE memory DROP COLUMN origin_id`,
+		`ALTER TABLE memory DROP COLUMN ref`,
+		`ALTER TABLE memory DROP COLUMN fs_node`,
+		`UPDATE schema_version SET version = 2`,
+	} {
+		if _, err := db.Exec(stmt); err != nil {
+			db.Close()
+			t.Fatalf("downgrade %q: %v", stmt, err)
+		}
+	}
+	db.Close()
+
+	up, err := memstore.Open(path)
+	if err != nil {
+		t.Fatalf("Open of a v2 file: %v, want the upgrade on open", err)
+	}
+	defer up.Close()
+
+	rdb, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatalf("sql.Open: %v", err)
+	}
+	defer rdb.Close()
+	var v int
+	if err := rdb.QueryRow(`SELECT version FROM schema_version`).Scan(&v); err != nil {
+		t.Fatalf("SELECT schema_version: %v", err)
+	}
+	if v != 3 {
+		t.Errorf("schema_version = %d after upgrade, want 3", v)
+	}
+	var cols int
+	if err := rdb.QueryRow(`SELECT count(*) FROM pragma_table_info('memory') WHERE name IN ('origin', 'origin_id', 'ref', 'fs_node')`).Scan(&cols); err != nil {
+		t.Fatalf("count provenance columns: %v", err)
+	}
+	if cols != 4 {
+		t.Errorf("%d provenance columns after upgrade, want 4", cols)
+	}
+
+	// A row from before the upgrade reads unchanged, its origin defaulted to
+	// 'native' by the added column.
+	old, err := up.Get(oldID)
+	if err != nil {
+		t.Fatalf("Get of a pre-upgrade row: %v", err)
+	}
+	if old.Text != "content born at v2" {
+		t.Errorf("Text = %q, want the pre-upgrade bytes", old.Text)
+	}
+	if old.Origin != "native" || old.OriginId != "" || old.Ref != "" || old.FsNode != "" {
+		t.Errorf("upgraded row provenance = %q/%q/%q/%q, want native and three empty", old.Origin, old.OriginId, old.Ref, old.FsNode)
+	}
+
+	// New rows land in the current shape.
+	nid, err := up.Put(&memstore.Memory{Kind: "note", Text: "born after the upgrade"})
+	if err != nil {
+		t.Fatalf("Put after upgrade: %v", err)
+	}
+	got, err := up.Get(nid)
+	if err != nil {
+		t.Fatalf("Get after upgrade: %v", err)
+	}
+	if got.Origin != "native" {
+		t.Errorf("Origin = %q after upgrade, want native", got.Origin)
+	}
+}
+
+// fsEv is one row of the fixture fs events table.
+type fsEv struct {
+	id, ts, project, node, parent, eventType, payload, sha string
+}
+
+// fixtureEvents spans two projects (alpha, beta) and three nodes (na, nb, nc),
+// with a parent→child pair in each direction the resolver must serve (e4 → e1,
+// e6 → e4), a dangling parent (e9 → t-ghost) that names no imported row, and
+// enough event types to cover every mapping branch of the import.
+var fixtureEvents = []fsEv{
+	{"e1", "2026-09-18T14:02:42.100Z", "alpha", "na", "", "task-created", `{"goal":"Build the import upstream"}`, "c1"},
+	{"e2", "2026-09-18T14:02:43.200Z", "alpha", "na", "", "decision-recorded", `{"summary":"the widget is blue"}`, "c2"},
+	{"e3", "2026-09-18T14:02:44.300Z", "alpha", "na", "", "report-recorded", `{"kind":"done","line":"import landed"}`, "c3"},
+	{"e4", "2026-09-18T14:02:45.400Z", "beta", "nb", "na", "knowledge-added", `{"summary":"fuzzy recall wants an index"}`, "c4"},
+	{"e5", "2026-09-18T14:02:46.500Z", "beta", "nb", "", "status-changed", `{"from":"pending","to":"active"}`, "c5"},
+	{"e6", "2026-09-18T14:02:47.600Z", "beta", "nc", "nb", "task-blocked", `{"line":"waiting on the key"}`, "c6"},
+	{"e7", "2026-09-18T14:02:48.700123456Z", "beta", "nc", "", "delivery-recorded", `{"agent":"dispatch-1","pane_id":"w1:p9"}`, "c7"},
+	{"e8", "2026-09-18T14:02:49Z", "alpha", "", "", "project-created", `{}`, "c8"},
+	{"e9", "2026-09-18T14:02:50Z", "beta", "nb", "t-ghost", "plan-recorded", `{"plan":[],"tags":{}}`, "c9"},
+}
+
+// buildFSSource writes the fs events table, as fs defines it, to path.
+func buildFSSource(t *testing.T, path string) {
+	t.Helper()
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatalf("sql.Open: %v", err)
+	}
+	defer db.Close()
+	if _, err := db.Exec(`CREATE TABLE events (
+		id             TEXT PRIMARY KEY,
+		timestamp      TEXT NOT NULL,
+		type           TEXT NOT NULL,
+		project_id     TEXT NOT NULL,
+		node_id        TEXT,
+		parent_node_id TEXT,
+		commit_sha     TEXT,
+		payload        TEXT NOT NULL DEFAULT '{}'
+	)`); err != nil {
+		t.Fatalf("create events: %v", err)
+	}
+	for _, e := range fixtureEvents {
+		if _, err := db.Exec(`INSERT INTO events (id, timestamp, project_id, node_id, parent_node_id, type, payload, commit_sha)
+			VALUES (?, ?, ?, NULLIF(?, ''), NULLIF(?, ''), ?, ?, NULLIF(?, ''))`,
+			e.id, e.ts, e.project, e.node, e.parent, e.eventType, e.payload, e.sha); err != nil {
+			t.Fatalf("insert %s: %v", e.id, err)
+		}
+	}
+}
+
+// Card 3 §3: importing the fixture lands every mapped field — scope, kind,
+// title, text, ref, origin, origin_id, fs_node, extra — and resolves parent to
+// the local id of the parent node's earliest imported row. A parent_node_id
+// that names no imported row stays NULL and does not fail the import; the event
+// timestamp and the open status survive.
+func TestImportMapsEveryField(t *testing.T) {
+	s := openTemp(t)
+	src := filepath.Join(t.TempDir(), "fs-events.db")
+	buildFSSource(t, src)
+
+	imported, skipped, err := s.Import(src, memstore.ImportOptions{})
+	if err != nil {
+		t.Fatalf("Import: %v", err)
+	}
+	if imported != len(fixtureEvents) {
+		t.Errorf("imported = %d, want %d", imported, len(fixtureEvents))
+	}
+	if skipped != 0 {
+		t.Errorf("skipped = %d, want 0 on a fresh store", skipped)
+	}
+
+	// The fs_node index the card names exists.
+	db, err := sql.Open("sqlite", s.Path())
+	if err != nil {
+		t.Fatalf("sql.Open: %v", err)
+	}
+	defer db.Close()
+	var idx int
+	if err := db.QueryRow(`SELECT count(*) FROM sqlite_master WHERE type = 'index' AND name = 'idx_memory_fs_node'`).Scan(&idx); err != nil {
+		t.Fatalf("find fs_node index: %v", err)
+	}
+	if idx != 1 {
+		t.Errorf("idx_memory_fs_node: %d rows, want 1", idx)
+	}
+
+	idByOrigin := map[string]int64{}
+	rows, err := db.Query(`SELECT id, origin_id FROM memory WHERE origin = 'imported'`)
+	if err != nil {
+		t.Fatalf("query imported rows: %v", err)
+	}
+	for rows.Next() {
+		var id int64
+		var oid string
+		if err := rows.Scan(&id, &oid); err != nil {
+			t.Fatalf("scan: %v", err)
+		}
+		idByOrigin[oid] = id
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		t.Fatalf("rows: %v", err)
+	}
+	if len(idByOrigin) != len(fixtureEvents) {
+		t.Fatalf("imported %d distinct events, want %d", len(idByOrigin), len(fixtureEvents))
+	}
+
+	type wantRow struct {
+		scope, kind, title, text, extra, ref, origin, originID, fsNode string
+		parent                                                         string // origin_id of the expected parent; "" for none
+	}
+	want := map[string]wantRow{
+		"e1": {"alpha", "task", "Build the import upstream", "Build the import upstream", "", "c1", "imported", "e1", "na", ""},
+		"e2": {"alpha", "decision", "the widget is blue", "the widget is blue", "", "c2", "imported", "e2", "na", ""},
+		"e3": {"alpha", "report", "import landed", "import landed", `{"kind":"done"}`, "c3", "imported", "e3", "na", ""},
+		"e4": {"beta", "knowledge", "fuzzy recall wants an index", "fuzzy recall wants an index", "", "c4", "imported", "e4", "nb", "e1"},
+		"e5": {"beta", "event", "status-changed", `{"from":"pending","to":"active"}`, "", "c5", "imported", "e5", "nb", ""},
+		"e6": {"beta", "task-blocked", "waiting on the key", "waiting on the key", "", "c6", "imported", "e6", "nc", "e4"},
+		"e7": {"beta", "event", "delivery-recorded", `{"agent":"dispatch-1","pane_id":"w1:p9"}`, "", "c7", "imported", "e7", "nc", ""},
+		"e8": {"alpha", "project-created", "project-created", "{}", "", "c8", "imported", "e8", "", ""},
+		"e9": {"beta", "plan", "plan-recorded", `{"plan":[],"tags":{}}`, "", "c9", "imported", "e9", "nb", ""},
+	}
+	for _, ev := range fixtureEvents {
+		got, err := s.Get(idByOrigin[ev.id])
+		if err != nil {
+			t.Fatalf("Get %s (id %d): %v", ev.id, idByOrigin[ev.id], err)
+		}
+		w := want[ev.id]
+		if got.Scope != w.scope || got.Kind != w.kind || got.Title != w.title || got.Text != w.text ||
+			got.Extra != w.extra || got.Ref != w.ref || got.Origin != w.origin || got.OriginId != w.originID || got.FsNode != w.fsNode {
+			t.Errorf("%s: imported %+v, want %+v", ev.id, got, w)
+		}
+		if got.Status != "open" {
+			t.Errorf("%s: Status = %q, want open", ev.id, got.Status)
+		}
+		ts, err := time.Parse(time.RFC3339Nano, ev.ts)
+		if err != nil {
+			t.Fatalf("parse fixture ts: %v", err)
+		}
+		if !got.Ts.Equal(ts) {
+			t.Errorf("%s: Ts = %v, want %v", ev.id, got.Ts, ts)
+		}
+		if w.parent == "" {
+			if got.Parent != nil {
+				t.Errorf("%s: Parent = %v, want nil", ev.id, got.Parent)
+			}
+		} else {
+			if got.Parent == nil {
+				t.Errorf("%s: Parent = nil, want the imported row of %s", ev.id, w.parent)
+			} else if *got.Parent != idByOrigin[w.parent] {
+				t.Errorf("%s: Parent = %d, want %d (imported %s)", ev.id, *got.Parent, idByOrigin[w.parent], w.parent)
+			}
+		}
+	}
+}
+
+// Card 3 §4: importing the same fixture again imports 0 and skips every event;
+// no duplicate rows appear; and an existing native row's bytes are untouched
+// by any import.
+func TestImportIdempotentAndLeavesNativeAlone(t *testing.T) {
+	s := openTemp(t)
+	native, err := s.Put(&memstore.Memory{Kind: "note", Text: "native-marker-milk"})
+	if err != nil {
+		t.Fatalf("Put native: %v", err)
+	}
+	src := filepath.Join(t.TempDir(), "fs-events.db")
+	buildFSSource(t, src)
+
+	if _, _, err := s.Import(src, memstore.ImportOptions{}); err != nil {
+		t.Fatalf("first Import: %v", err)
+	}
+	imported, skipped, err := s.Import(src, memstore.ImportOptions{})
+	if err != nil {
+		t.Fatalf("second Import: %v", err)
+	}
+	if imported != 0 {
+		t.Errorf("second import imported %d, want 0", imported)
+	}
+	if skipped != len(fixtureEvents) {
+		t.Errorf("second import skipped %d, want %d", skipped, len(fixtureEvents))
+	}
+
+	db, err := sql.Open("sqlite", s.Path())
+	if err != nil {
+		t.Fatalf("sql.Open: %v", err)
+	}
+	defer db.Close()
+	var n int
+	if err := db.QueryRow(`SELECT count(*) FROM memory WHERE origin = 'imported'`).Scan(&n); err != nil {
+		t.Fatalf("count imported rows: %v", err)
+	}
+	if n != len(fixtureEvents) {
+		t.Errorf("%d imported rows after two imports, want %d — duplicates slipped in", n, len(fixtureEvents))
+	}
+
+	if _, _, err := s.Import(src, memstore.ImportOptions{}); err != nil {
+		t.Fatalf("third Import: %v", err)
+	}
+	after, err := s.Get(native)
+	if err != nil {
+		t.Fatalf("Get native: %v", err)
+	}
+	if after.Text != "native-marker-milk" || after.Origin != "native" || after.Status != "open" {
+		t.Errorf("native row after imports = %+v, want the untouched put", after)
+	}
+}
+
+// Card 3 §5: an unreadable or non-events source fails with an error and writes
+// nothing; a source carrying an event whose timestamp does not parse fails the
+// whole import — fail closed on write — the good events included.
+func TestImportErrorsWriteNothing(t *testing.T) {
+	s := openTemp(t)
+
+	// A missing file.
+	if _, _, err := s.Import(filepath.Join(t.TempDir(), "no-such.db"), memstore.ImportOptions{}); err == nil {
+		t.Error("Import of a missing file: got nil error, want error")
+	}
+	// A file that is not a database.
+	garbage := filepath.Join(t.TempDir(), "garbage.db")
+	if err := os.WriteFile(garbage, []byte("this is not a sqlite database"), 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	if _, _, err := s.Import(garbage, memstore.ImportOptions{}); err == nil {
+		t.Error("Import of a garbage file: got nil error, want error")
+	}
+	// A memory store has no events table; it is a non-events source.
+	if _, _, err := s.Import(s.Path(), memstore.ImportOptions{}); err == nil {
+		t.Error("Import of a non-events store: got nil error, want error")
+	}
+	st, err := s.Stats()
+	if err != nil {
+		t.Fatalf("Stats: %v", err)
+	}
+	if st.Total != 0 {
+		t.Errorf("failed imports left %d rows, want 0 — a failed import writes nothing", st.Total)
+	}
+
+	// A source with one unparseable timestamp fails the whole import: the good
+	// event before it rolls back too.
+	bad := filepath.Join(t.TempDir(), "bad-ts.db")
+	db, err := sql.Open("sqlite", bad)
+	if err != nil {
+		t.Fatalf("sql.Open: %v", err)
+	}
+	if _, err := db.Exec(`CREATE TABLE events (
+		id TEXT PRIMARY KEY, timestamp TEXT NOT NULL, type TEXT NOT NULL,
+		project_id TEXT NOT NULL, node_id TEXT, parent_node_id TEXT,
+		commit_sha TEXT, payload TEXT NOT NULL DEFAULT '{}')`); err != nil {
+		t.Fatalf("create events: %v", err)
+	}
+	if _, err := db.Exec(`INSERT INTO events (id, timestamp, type, project_id, payload)
+		VALUES ('ok', '2026-09-18T14:02:42Z', 'task-created', 'alpha', '{"goal":"fine"}')`); err != nil {
+		t.Fatalf("insert good event: %v", err)
+	}
+	if _, err := db.Exec(`INSERT INTO events (id, timestamp, type, project_id, payload)
+		VALUES ('bad', 'back in the future', 'task-created', 'alpha', '{"goal":"breaks"}')`); err != nil {
+		t.Fatalf("insert bad event: %v", err)
+	}
+	db.Close()
+
+	if _, _, err := s.Import(bad, memstore.ImportOptions{}); err == nil {
+		t.Error("Import with an unparseable timestamp: got nil error, want error")
+	}
+	st, err = s.Stats()
+	if err != nil {
+		t.Fatalf("Stats: %v", err)
+	}
+	if st.Total != 0 {
+		t.Errorf("failed timestamp import left %d rows, want 0 — import must be all-or-nothing", st.Total)
 	}
 }

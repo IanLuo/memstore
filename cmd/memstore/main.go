@@ -39,6 +39,8 @@ func main() {
 		err = runLink(os.Args[2:])
 	case "stats":
 		err = runStats(os.Args[2:])
+	case "import":
+		err = runImport(os.Args[2:])
 	default:
 		usage()
 		os.Exit(2)
@@ -70,6 +72,7 @@ func usage() {
   recent [-k N] [SCOPE...]                        newest memories first, as JSON
   link FROM REL TO                                record an edge; the walk surfaces superseded-by / found-by
   stats                                           the store's shape: counts, file bytes, ts bounds
+  import SRC_STORE.db                             ingest fs events one-way (provenance recorded, idempotent)
 
 The store is $MEMSTORE_DB, or ~/.memstore/memory.db.
 `)
@@ -262,6 +265,25 @@ func runStats(args []string) error {
 		return err
 	}
 	return writeJSON(st)
+}
+
+func runImport(args []string) error {
+	fs := flag.NewFlagSet("import", flag.ExitOnError)
+	fs.Parse(args)
+	if fs.NArg() != 1 {
+		return errors.New("import: want exactly one source store path")
+	}
+	s, err := openStore()
+	if err != nil {
+		return err
+	}
+	defer s.Close()
+	imported, skipped, err := s.Import(fs.Arg(0), memstore.ImportOptions{})
+	if err != nil {
+		return err
+	}
+	fmt.Printf("imported %d, skipped %d\n", imported, skipped)
+	return nil
 }
 
 func openStore() (*memstore.Store, error) {
