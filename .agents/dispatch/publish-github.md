@@ -72,12 +72,13 @@ not your step.
    and every byte of it is the cap's own text that must not stay in a working tree. Untracked:
    `.agents/dispatch/nfr-rebase.md` and `.agents/dispatch/publish-github.md`. Modified:
    `.agents/dispatch/probe-adoption-evidence.md` (the cap's marking note on its wrong NFR
-   quotation), and both `.agents/specs/*.md` — `memory-store.md` carries the 1.3× withdrawal
-   and the per-revision evidence cite, `memory-store-design.md` carries the schema-bump policy
-   clause, each on top of its marker line. **Commit the content of all of them in this round's
-   commit**, then rotate the two marker lines to that commit and leave those two lines dirty,
-   which is the convention. Stage **by name**; never `git add -A`, and never
-   `git checkout --`, `restore` or `stash` anything under `.agents/specs/` — those content
+   quotation), and `.agents/specs/memory-store.md`, which carries the 1.3× withdrawal and the
+   per-revision evidence cite on top of its marker line. **`memory-store-design.md` carries only
+   its marker line** — its schema-bump policy clause was committed at `b3e5e0c`, so it needs no
+   content commit, and an earlier draft of this item wrongly said it did. **Commit the content
+   of what is genuinely uncommitted**, then rotate the two marker lines to that commit and leave
+   those two lines dirty, which is the convention. Stage **by name**; never `git add -A`, and
+   never `git checkout --`, `restore` or `stash` anything under `.agents/specs/` — those content
    revisions exist nowhere else, and two of them are the only record of findings this session
    disposed of.
 7. **Rotate both lock markers** to this commit. Under the policy the spec now states, a

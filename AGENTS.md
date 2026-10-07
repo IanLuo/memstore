@@ -73,4 +73,4 @@ matchers.go       — Matchers: lexical ∪ relation-walk ∪ optional vector, r
 - `.agents/specs/memory-store-design.md` — the locked system design: components, data
   model, failure modes, scale assumptions.
 
-Last verified: 2026-10-07.
+Last verified: 2026-10-08.

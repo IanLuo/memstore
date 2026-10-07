@@ -23,8 +23,13 @@ The store is `$MEMSTORE_DB`, or `~/.memstore/memory.db` when that is unset.
 
 ```bash
 memstore put -kind decision "search returns best first"
-memstore search -k 5 "how are results ordered"
+memstore search -k 5 "which result ranks best"   # shares the stem "best" — returns the row
+memstore search -k 5 "how are results ordered"   # zero shared stems — prints []
 ```
+
+The first search shares a stem with the memory and returns it. The second shares
+none, and `search` is lexical — **no embedder exists anywhere in this project** —
+so zero overlap returns `[]`. That is the limit below, not a failure.
 
 ## Test
 
@@ -34,7 +39,7 @@ memstore search -k 5 "how are results ordered"
 nix develop --command go test ./...
 nix develop --command go build ./...
 nix develop --command go vet ./...
-nix develop --command gofmt -l .          # vendor/ is third-party; check first-party files only
+nix develop --command gofmt -l cmd *.go   # vendor/ is third-party; only gofmt walks it
 ```
 
 The NFR benchmark is `nix develop --command go run ./cmd/bench`.

@@ -7,7 +7,9 @@
 
   outputs = { nixpkgs, ... }:
     let
-      systems = [ "aarch64-darwin" "x86_64-darwin" "aarch64-linux" "x86_64-linux" ];
+      # x86_64-darwin is not listed: nixpkgs 26.11 dropped the platform, so both
+      # devShells.x86_64-darwin and packages.x86_64-darwin throw rather than eval.
+      systems = [ "aarch64-darwin" "aarch64-linux" "x86_64-linux" ];
       eachSystem = nixpkgs.lib.genAttrs systems;
       pkgsFor = system: nixpkgs.legacyPackages.${system};
     in {
