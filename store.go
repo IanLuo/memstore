@@ -196,7 +196,7 @@ func Open(path string) (*Store, error) {
 		}
 		if v != 2 && v != 3 && v != schemaVersion {
 			db.Close()
-			return nil, fmt.Errorf("memstore: open %s: schema_version is %d, want %d (unix-nanosecond timestamps)", path, v, schemaVersion)
+			return nil, fmt.Errorf("memstore: open %s: schema_version is %d, want %d (porter-tokenized FTS index)", path, v, schemaVersion)
 		}
 	}
 	// journal_mode is stored in the file, so switch to WAL only when it is not

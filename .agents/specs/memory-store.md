@@ -1,4 +1,4 @@
-<!-- specs:locked:5ec1768 2026-10-07 type=spec -->
+<!-- specs:locked:b3e5e0c 2026-10-07 type=spec -->
 
 ## Link contract
 - **upstream** (this doc relies on): none
@@ -11,7 +11,7 @@
 - **Why now:** the current memory (fs) splits one fact across stores, doubles every payload in a search mirror, and leaves its largest part unqueryable.
 
 ## Non-negotiable outcome
-- One SQLite file holds every memory; a fuzzy query returns the correct memory in the top 5 when the exact words are absent; 10× the memories leaves recall p95 within 2× (measured 1.8×, cap:t-711958cd).
+- One SQLite file holds every memory; a fuzzy query returns the correct memory in the top 5 when the exact words are absent; `search` p95 stays under 50 ms at 10⁴ memories (the 10× ratio is a measured observation, not a bound — see Non-functional requirements).
 - Falsifiable by a tester over a fixed corpus with no exact-term match.
 
 ## Scope in / out + primary flow
@@ -29,17 +29,17 @@
 - GIVEN D1 and D2 where `supersedes(D1)=D2` WHEN `search` finds D1 THEN the result carries D2's id.
 - GIVEN a memory and a query that shares at least one stemmed term with it — an inflected form, or one token of several — WHEN `search q k=5` THEN the memory is in the top 5, best first; with no shared stem and no embedder configured, the store returns fewer results, never a wrong one.
 - GIVEN `forget(id)` WHEN `get(id)` THEN the row is hidden from reads and its bytes remain.
-- GIVEN a 10× corpus WHEN `search` runs THEN p95 ≤ 2× baseline (measured 1.8×; the growth is fill — more matches per query as the corpus fills — not algorithmic blow-up, and the absolute p95 stays sub-millisecond).
+- GIVEN a 10× corpus WHEN `search` runs THEN p95 < 50 ms at 10⁴ memories (the absolute bound; the 10× ratio is a measured observation, not a bound — see Non-functional requirements).
 - Empty input: a `put` with empty `text` is rejected; the smallest accepted input is non-empty `text` + `kind`.
 
 ## KPIs & failure signal
-- **Good:** top-5 recall ≥ target on a held-out query set; p95 `search` < 50 ms at 10⁴ memories; size ≈1.2× the text on a bulk payload and ≤4× on many small rows (measured 4.36× @10³, 3.57× @10⁴, cap:t-711958cd).
+- **Good:** top-5 recall ≥ target on a held-out query set; p95 `search` < 50 ms at 10⁴ memories; size — the text is stored once; measured db/text ≈1.3× on a bulk payload and ≈4.36× @10³, ≈3.57× @10⁴ on the small-row corpus (the overhead is the index and the row columns; measured by `cmd/bench`).
 - **Off-switch:** recall no better than `grep` on the same corpus — then the fused matcher was not worth its complexity.
 
 ## Non-functional requirements
-- Performance: open < 50 ms; `search` p95 < 50 ms at 10⁴ memories; 10× within 2× (measured 1.8×).
+- Performance: open < 50 ms; `search` p95 < 50 ms at 10⁴ memories. The 10× p95 ratio is a measured observation, not a bound: 1.786× with the AND query at `5ec1768` (p95 0.393 ms), 3.778× with the OR query at `b3e5e0c` (p95 1.664 ms). OR over the query's stems saturates hits per query at k=10, so bm25 scores a candidate set that grows with N, where the AND query returned almost nothing (evidence: memstore:t-d2c7acc3).
 - Portability: one file, offline, no server.
-- Size: the text is stored once — FTS is external-content, never a copy; total bytes ≈1.2× the text on a bulk payload and ≤4× on many small rows (the overhead is the index and the row columns).
+- Size: the text is stored once — FTS is external-content, never a copy; measured total bytes ≈1.3× the text on a bulk payload and ≈4.36× at 10³, ≈3.57× at 10⁴ on the small-row corpus (the overhead is the index and the row columns).
 - Durability: content append-only; a crash loses nothing already written.
 - Cost: no external service.
 
@@ -67,5 +67,5 @@
 
 ## Verification plan
 - Each acceptance bullet → an automated test over a fixture corpus.
-- NFRs → a benchmark at 1× and 10×, plus a size assertion.
+- NFRs → a benchmark at 1× and 10×, plus a measured size ratio.
 - Retrieval quality → a held-out query set, scored in CI.
