@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -247,6 +248,65 @@ func TestOpenRefusesUnexpectedSchemaVersion(t *testing.T) {
 		} else if got := err.Error(); !strings.Contains(got, fmt.Sprintf("schema_version is %d", stamp)) {
 			t.Errorf("Open of schema_version-%d db refused with %q, want the found version %d named", stamp, got, stamp)
 		}
+	}
+}
+
+// Card acceptance: concurrent callers queue, not fail. Two Store handles on
+// one file are two sql.DB pools, so they contend the way two processes do; a
+// goroutine test on one handle cannot reproduce the defect. Every write must
+// succeed and the stored row count must equal the writes attempted plus the
+// seed row.
+func TestConcurrentWritersQueue(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "memory.db")
+	first, err := memstore.Open(path)
+	if err != nil {
+		t.Fatalf("Open first: %v", err)
+	}
+	defer first.Close()
+	if _, err := first.Put(&memstore.Memory{Kind: "seed", Text: "seed row"}); err != nil {
+		t.Fatalf("seed Put: %v", err)
+	}
+	second, err := memstore.Open(path)
+	if err != nil {
+		t.Fatalf("Open second: %v", err)
+	}
+	defer second.Close()
+
+	const writers = 2
+	const perWriter = 20
+	start := make(chan struct{})
+	errs := make(chan error, writers*perWriter)
+	var wg sync.WaitGroup
+	for i, s := range []*memstore.Store{first, second} {
+		wg.Add(1)
+		go func(i int, s *memstore.Store) {
+			defer wg.Done()
+			<-start
+			for j := 0; j < perWriter; j++ {
+				if _, err := s.Put(&memstore.Memory{Kind: "note", Text: fmt.Sprintf("writer %d row %d", i, j)}); err != nil {
+					errs <- err
+				}
+			}
+		}(i, s)
+	}
+	close(start)
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Errorf("concurrent Put: %v", err)
+	}
+
+	rdb, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatalf("sql.Open: %v", err)
+	}
+	defer rdb.Close()
+	var n int
+	if err := rdb.QueryRow(`SELECT count(*) FROM memory`).Scan(&n); err != nil {
+		t.Fatalf("count rows: %v", err)
+	}
+	if want := 1 + writers*perWriter; n != want {
+		t.Errorf("stored rows = %d, want %d (seed + writes attempted)", n, want)
 	}
 }
 

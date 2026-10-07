@@ -157,25 +157,36 @@ func Open(path string) (*Store, error) {
 			return nil, fmt.Errorf("memstore: create %s: %w", dir, err)
 		}
 	}
-	db, err := sql.Open("sqlite", path)
+	// _txlock=immediate makes every transaction take the write lock at BEGIN.
+	// A deferred transaction that reads before it writes is refused with
+	// SQLITE_BUSY when another writer got there first, and SQLite does not run
+	// the busy timeout for that upgrade, so the timeout alone would not make
+	// writers queue.
+	db, err := sql.Open("sqlite", path+"?_txlock=immediate")
 	if err != nil {
 		return nil, fmt.Errorf("memstore: open %s: %w", path, err)
 	}
-	// One writer by design; a single connection keeps concurrent callers from
-	// racing two connections into SQLITE_BUSY.
+	// One writer by design. One connection serializes callers inside this
+	// process; the busy timeout makes a caller in another process wait for the
+	// lock instead of failing, which SetMaxOpenConns cannot do — the CLI is a
+	// new process per command.
 	db.SetMaxOpenConns(1)
+	if _, err := db.Exec(`PRAGMA busy_timeout = 5000;`); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("memstore: configure %s: %w", path, err)
+	}
 	// Refuse a file stamped with a schema_version we do not expect before
 	// anything touches it — no WAL, no schema write, no chmod. The recognized
 	// versions are 2 (the previous format, upgraded below) and the current one;
 	// a version-1 file stores ts in seconds, not nanoseconds, and reading it as
 	// current would silently show 1970.
+	v := 0
 	var stamped int
 	if err := db.QueryRow(`SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'schema_version'`).Scan(&stamped); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("memstore: read %s: %w", path, err)
 	}
 	if stamped == 1 {
-		v := 0
 		if err := db.QueryRow(`SELECT version FROM schema_version`).Scan(&v); err != nil {
 			db.Close()
 			return nil, fmt.Errorf("memstore: read schema_version from %s: %w", path, err)
@@ -185,45 +196,65 @@ func Open(path string) (*Store, error) {
 			return nil, fmt.Errorf("memstore: open %s: schema_version is %d, want %d (unix-nanosecond timestamps)", path, v, schemaVersion)
 		}
 	}
-	if _, err := db.Exec(`PRAGMA journal_mode = WAL; PRAGMA synchronous = FULL;`); err != nil {
+	// journal_mode is stored in the file, so switch to WAL only when it is not
+	// already WAL. synchronous is per connection and is set on every open.
+	// Neither is a schema write, so a file already at the current version takes
+	// no write lock on open — otherwise a reader racing a writer fails.
+	var mode string
+	if err := db.QueryRow(`PRAGMA journal_mode;`).Scan(&mode); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("memstore: configure %s: %w", path, err)
 	}
-	if _, err := db.Exec(schema); err != nil {
-		db.Close()
-		return nil, fmt.Errorf("memstore: apply schema to %s: %w", path, err)
-	}
-	// A file stamped schema_version 2 predates the provenance columns. The
-	// upgrade is additive, guarded step by step by what already exists, so it
-	// is safe to run at every Open: the missing columns are added with their v3
-	// definition, the fs_node index is created, and the version row moves to 3.
-	// Existing rows are untouched — their origin picks up the column's default
-	// 'native'.
-	for _, add := range []struct{ col, ddl string }{
-		{"origin", "TEXT NOT NULL DEFAULT 'native'"},
-		{"origin_id", "TEXT"},
-		{"ref", "TEXT"},
-		{"fs_node", "TEXT"},
-	} {
-		var have int
-		if err := db.QueryRow(`SELECT count(*) FROM pragma_table_info('memory') WHERE name = ?`, add.col).Scan(&have); err != nil {
+	if !strings.EqualFold(mode, "wal") {
+		if _, err := db.Exec(`PRAGMA journal_mode = WAL;`); err != nil {
 			db.Close()
-			return nil, fmt.Errorf("memstore: upgrade %s: %w", path, err)
+			return nil, fmt.Errorf("memstore: configure %s: %w", path, err)
 		}
-		if have == 0 {
-			if _, err := db.Exec(`ALTER TABLE memory ADD COLUMN ` + add.col + ` ` + add.ddl); err != nil {
+	}
+	if _, err := db.Exec(`PRAGMA synchronous = FULL;`); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("memstore: configure %s: %w", path, err)
+	}
+	// A file already at the current version has its whole schema; applying it
+	// again would take the write lock on every open for nothing. Only a fresh or
+	// v2 file is brought to the current shape.
+	if v != schemaVersion {
+		if _, err := db.Exec(schema); err != nil {
+			db.Close()
+			return nil, fmt.Errorf("memstore: apply schema to %s: %w", path, err)
+		}
+		// A file stamped schema_version 2 predates the provenance columns. The
+		// upgrade is additive, guarded step by step by what already exists, so it
+		// is safe whenever the schema is applied: the missing columns are added
+		// with their v3 definition, the fs_node index is created, and the version
+		// row moves to 3. Existing rows are untouched — their origin picks up the
+		// column's default 'native'.
+		for _, add := range []struct{ col, ddl string }{
+			{"origin", "TEXT NOT NULL DEFAULT 'native'"},
+			{"origin_id", "TEXT"},
+			{"ref", "TEXT"},
+			{"fs_node", "TEXT"},
+		} {
+			var have int
+			if err := db.QueryRow(`SELECT count(*) FROM pragma_table_info('memory') WHERE name = ?`, add.col).Scan(&have); err != nil {
 				db.Close()
 				return nil, fmt.Errorf("memstore: upgrade %s: %w", path, err)
 			}
+			if have == 0 {
+				if _, err := db.Exec(`ALTER TABLE memory ADD COLUMN ` + add.col + ` ` + add.ddl); err != nil {
+					db.Close()
+					return nil, fmt.Errorf("memstore: upgrade %s: %w", path, err)
+				}
+			}
 		}
-	}
-	if _, err := db.Exec(`CREATE INDEX IF NOT EXISTS idx_memory_fs_node ON memory(fs_node)`); err != nil {
-		db.Close()
-		return nil, fmt.Errorf("memstore: upgrade %s: %w", path, err)
-	}
-	if _, err := db.Exec(`UPDATE schema_version SET version = ? WHERE version = 2`, schemaVersion); err != nil {
-		db.Close()
-		return nil, fmt.Errorf("memstore: upgrade %s: %w", path, err)
+		if _, err := db.Exec(`CREATE INDEX IF NOT EXISTS idx_memory_fs_node ON memory(fs_node)`); err != nil {
+			db.Close()
+			return nil, fmt.Errorf("memstore: upgrade %s: %w", path, err)
+		}
+		if _, err := db.Exec(`UPDATE schema_version SET version = ? WHERE version = 2`, schemaVersion); err != nil {
+			db.Close()
+			return nil, fmt.Errorf("memstore: upgrade %s: %w", path, err)
+		}
 	}
 	// The store is user-only: the file and its WAL sidecars hold memory text,
 	// and sqlite creates them under the umask, which may let group or other
