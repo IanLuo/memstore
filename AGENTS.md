@@ -19,7 +19,7 @@ nix develop
 nix develop --command go build -o /tmp/memstore ./cmd/memstore
 nix develop --command go test ./...
 nix develop --command go vet ./...
-nix develop --command gofmt -l .          # prints nothing when clean
+nix develop --command gofmt -l cmd *.go   # prints nothing — vendor/ excluded; only gofmt walks it
 
 # Run — the store is $MEMSTORE_DB, or ~/.memstore/memory.db
 /tmp/memstore put -kind decision "text"

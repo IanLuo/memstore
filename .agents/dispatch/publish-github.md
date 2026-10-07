@@ -68,15 +68,33 @@ not your step.
    so a query with **zero** shared stems returns nothing; **`forget` is one-way** (no verb
    restores it); `schema_version` is 4. A README that promises "search by meaning" would be
    the third time this project wrote a claim its code does not make.
-6. **Commit the untracked record.** `.agents/dispatch/nfr-rebase.md` is untracked — the only
-   card not in git — and nothing else will commit it. Stage everything **by name**; never
-   `git add -A`, and never `git checkout --`, `restore` or `stash` anything under
-   `.agents/specs/`.
+6. **Commit the whole uncommitted record, by name.** More is dirty than the card first said,
+   and every byte of it is the cap's own text that must not stay in a working tree. Untracked:
+   `.agents/dispatch/nfr-rebase.md` and `.agents/dispatch/publish-github.md`. Modified:
+   `.agents/dispatch/probe-adoption-evidence.md` (the cap's marking note on its wrong NFR
+   quotation), and both `.agents/specs/*.md` — `memory-store.md` carries the 1.3× withdrawal
+   and the per-revision evidence cite, `memory-store-design.md` carries the schema-bump policy
+   clause, each on top of its marker line. **Commit the content of all of them in this round's
+   commit**, then rotate the two marker lines to that commit and leave those two lines dirty,
+   which is the convention. Stage **by name**; never `git add -A`, and never
+   `git checkout --`, `restore` or `stash` anything under `.agents/specs/` — those content
+   revisions exist nowhere else, and two of them are the only record of findings this session
+   disposed of.
 7. **Rotate both lock markers** to this commit. Under the policy the spec now states, a
    commit invalidates the lock even when no criterion moves; say so in the decision rather
    than inventing a change. **No acceptance criterion moves in this round** — and say that
    plainly, because a marker that rotates with no clause behind it is still a claim the doc
    was re-read.
+8. **Fix the command vendoring made false, in `AGENTS.md`.** Its "How to run / build / test"
+   block says `gofmt -l .          # prints nothing when clean`. That was true before this
+   round and is false after it: `go vet ./...` and `go test ./...` skip `vendor/` in module
+   mode, but `gofmt` is a file walker and does not, so it now lists third-party files.
+   Replace the line with `gofmt -l cmd *.go` and keep a short trailing note saying vendor is
+   excluded because only `gofmt` walks it. This is a **published** artefact in a round that
+   makes the repository public, which is why it is in scope here rather than left stale —
+   found by the worker as a question instead of being widened into silently, which was the
+   right call. If you have already committed when this arrives, make a **second** commit
+   for it and rotate the markers to the final commit; never amend.
 
 ## Acceptance — the check this is held to
 
@@ -84,19 +102,26 @@ not your step.
    `usage` and one real round — `put` a memory, `search` a paraphrase that shares one token
    with it, and get it back.
 2. `nix develop` still enters a shell with `go` and `gopls`.
-3. `go build ./...`, `go test ./... -count=1`, `go vet ./...`, `gofmt -l .` all clean, and
+3. `go build ./...`, `go test ./... -count=1` and `go vet ./...` all clean — module mode
+   skips `vendor/`, so those three are unaffected by the vendoring — and
+   **`gofmt -l cmd *.go` prints nothing.** Write it exactly that way: a bare `gofmt -l .`
+   walks `vendor/` and lists third-party files, which is what the worker reported. First-party
+   files are clean; nine vendor files are not, and none of them are ours to reformat.
    `TestConcurrentWritersQueue` still passes.
 4. `"$FS_BIN" script check-specs.sh` exits 0 with both markers naming your commit.
-5. `git status` is clean except the two marker-only spec edits, and `git log --stat` shows
-   the vendor tree committed.
+5. `git status` shows **exactly two** modified files — `.agents/specs/memory-store.md` and
+   `.agents/specs/memory-store-design.md` — and the only change in each is its `specs:locked:`
+   marker line. Nothing else is modified and nothing is untracked. `git log --stat` shows the
+   vendor tree in the commit.
 6. Paste the exact commands and their output on the node.
 
 ## Out of scope
 
 Pushing to GitHub — the cap does that. The `~/.config/darwin` home-manager change — a
 separate decision. A LICENSE file — the user has not chosen one, and picking a licence on
-someone's behalf is not a packaging detail. Do not touch the store, the recall behaviour,
-the NFR wording or the specs beyond the marker.
+someone's behalf is not a packaging detail. Do not touch the store, the recall behaviour or
+the NFR wording. The two specs' **content** is committed this round but **not edited**: the
+marker lines are the only thing you change in them.
 
 ## Budget
 
@@ -119,6 +144,7 @@ flake.nix
 flake.lock
 README.md
 .gitignore
+AGENTS.md
 cmd/memstore/main.go
 cmd/bench/main.go
 store_test.go
