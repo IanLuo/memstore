@@ -36,6 +36,14 @@ Report each against the locked spec's NFRs — `open < 50 ms`, `search p95 < 50 
 `10× within 1.5×`, `bytes ≤ 2× text` — and say plainly which hold and which do not. Do not
 smooth a miss; a failed bound is the finding.
 
+> **Corrected 2026-10-07, text only, by the cap.** The last two figures in that list were the
+> benchmark harness's own constants, never the locked spec's bounds: the spec bounded the 10×
+> delta at 2× and the size at ≤4×, and since `cf6cb8a` it bounds the absolute only (`search`
+> p95 < 50 ms at 10⁴), stating the ratio as a measured observation. The original sentence is
+> left above unedited because it is the provenance of the defect: a harness constant read back
+> to a worker as "the locked spec's NFRs" is how the bench came to print those numbers as
+> "locked bounds". Do not report against the struck pair.
+
 ## Part B — the fs-import dry-run
 
 Import a **copy** of the real `~/.fs/store.db` (never the original — the importer snapshots the

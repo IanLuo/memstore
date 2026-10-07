@@ -13,7 +13,7 @@ import (
 	"strconv"
 	"strings"
 
-	"memstore"
+	"github.com/IanLuo/memstore"
 )
 
 func main() {

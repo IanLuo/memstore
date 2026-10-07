@@ -17,7 +17,7 @@ import (
 	"time"
 	"unicode"
 
-	"memstore"
+	"github.com/IanLuo/memstore"
 
 	_ "modernc.org/sqlite"
 )

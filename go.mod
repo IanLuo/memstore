@@ -1,4 +1,4 @@
-module memstore
+module github.com/IanLuo/memstore
 
 go 1.27
 

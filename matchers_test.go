@@ -5,7 +5,7 @@ import (
 	"strings"
 	"testing"
 
-	"memstore"
+	"github.com/IanLuo/memstore"
 )
 
 // Card acceptance 1-4: with no embedder configured, the lexical matcher
