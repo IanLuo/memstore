@@ -8,6 +8,60 @@ import (
 	"memstore"
 )
 
+// Card acceptance 1-4: with no embedder configured, the lexical matcher
+// answers a paraphrase — bm25 over the porter-stemmed index, OR across the
+// query's stems — and returns nothing only when no stem is shared. The store
+// here never calls SetEmbedder, so the vector matcher is absent and every hit
+// is lexical.
+func TestSearchAnswersParaphrase(t *testing.T) {
+	s := openTemp(t)
+	const row = "memstore replaces the fs store layer: one SQLite file, FTS external-content, no mirror table"
+	target, err := s.Put(&memstore.Memory{Kind: "decision", Text: row})
+	if err != nil {
+		t.Fatalf("Put target: %v", err)
+	}
+	gate, err := s.Put(&memstore.Memory{Kind: "note", Text: "the release gates block the merge"})
+	if err != nil {
+		t.Fatalf("Put gate: %v", err)
+	}
+
+	// 1. One absent token must not sink a query whose other tokens match.
+	hits, err := s.Search("one file hold", 5)
+	if err != nil {
+		t.Fatalf("Search(one file hold): %v", err)
+	}
+	if !containsID(hits, target) {
+		t.Errorf("Search(one file hold) = %v, want %d in the top 5 — 'hold' is absent and the rest must still match", ids(hits), target)
+	}
+
+	// 2. A query reaches the stored word's inflection: 'gate' is the stem of 'gates'.
+	hits, err = s.Search("gate", 5)
+	if err != nil {
+		t.Fatalf("Search(gate): %v", err)
+	}
+	if !containsID(hits, gate) {
+		t.Errorf("Search(gate) = %v, want %d — the index must stem 'gates'", ids(hits), gate)
+	}
+
+	// 3. The memory's own text with one word removed ranks it first.
+	hits, err = s.Search(strings.Replace(row, "mirror ", "", 1), 5)
+	if err != nil {
+		t.Fatalf("Search(own text minus a word): %v", err)
+	}
+	if len(hits) == 0 || hits[0].Id != target {
+		t.Errorf("Search(own text minus a word) = %v, want the target %d first", ids(hits), target)
+	}
+
+	// 4. The fail-open half: no shared stem, no embedder, nothing — never noise.
+	hits, err = s.Search("how is memory persisted locally", 5)
+	if err != nil {
+		t.Fatalf("Search(zero overlap): %v", err)
+	}
+	if len(hits) != 0 {
+		t.Errorf("Search(zero overlap) = %v, want no rows with no shared stem and no embedder", ids(hits))
+	}
+}
+
 // Card section 2 / slice-4 review A1: a query with no alphanumeric token has
 // no lexical expression, and that used to short-circuit Search before the
 // vector matcher. With an embedder configured the query must still embed and

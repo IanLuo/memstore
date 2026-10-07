@@ -75,23 +75,25 @@ type Store struct {
 	dim      int
 }
 
-// schemaVersion is the schema_version row's current value: 3, the
-// unix-nanosecond timestamp format plus the provenance columns of slice 3.
-// Version 2 (the same timestamps, no provenance) is the previous format and
-// is upgraded on Open; version 1 (unix seconds, written by the first slice
-// release, 5aa287a) is refused, never misread; a file stamped with anything
-// else is refused on Open, never silently migrated or misread. Keep the INSERT
-// literal in schema equal to this; TestSchemaVersion pins both.
-const schemaVersion = 3
+// schemaVersion is the schema_version row's current value: 4, the porter
+// tokenizer on the FTS index over the v3 format (unix-nanosecond timestamps
+// plus the slice-3 provenance columns). Version 3 (default tokenizer) and
+// version 2 (no provenance) are upgraded on Open, both through the same path
+// that rebuilds record_fts; version 1 (unix seconds, written by the first
+// slice release, 5aa287a) is refused, never misread; a file stamped with
+// anything else is refused on Open, never silently migrated or misread. Keep
+// the INSERT literal in schema equal to this; TestSchemaVersion pins both.
+const schemaVersion = 4
 
 // schema is the whole database. record_fts is FTS5 external content over
-// memory (title, text): the text is indexed in place, never copied. Only an
-// INSERT trigger exists, because content is immutable; status, deleted_at and
-// tier may change without touching the index. edge is the thin relation table
-// of slice 2: enough to store an arbitrary relation between two memories and
-// walk it, nothing more. Adding it is additive — schema_version still names
-// the timestamp format (2, unix nanoseconds), so an existing v2 file gains
-// the table on open the same way it keeps the rest of the schema.
+// memory (title, text), tokenized by the porter stemmer so a query reaches a
+// stored word's inflections ("gate" reaches "gates"): the text is indexed in
+// place, never copied. Only an INSERT trigger exists, because content is
+// immutable; status, deleted_at and tier may change without touching the
+// index. The tokenizer is baked into the table at CREATE, so a file written
+// before v4 has its index rebuilt on open under the schema_version bump (see
+// Open). edge is the thin relation table of slice 2: enough to store an
+// arbitrary relation between two memories and walk it, nothing more.
 const schema = `
 CREATE TABLE IF NOT EXISTS edge (
 	from_id INTEGER NOT NULL REFERENCES memory(id),
@@ -125,7 +127,8 @@ CREATE TABLE IF NOT EXISTS memory (
 CREATE VIRTUAL TABLE IF NOT EXISTS record_fts USING fts5(
 	title, text,
 	content = 'memory',
-	content_rowid = 'id'
+	content_rowid = 'id',
+	tokenize = 'porter'
 );
 
 CREATE TRIGGER IF NOT EXISTS memory_ai AFTER INSERT ON memory BEGIN
@@ -134,7 +137,7 @@ END;
 
 CREATE TABLE IF NOT EXISTS schema_version (version INTEGER NOT NULL);
 INSERT INTO schema_version(version)
-	SELECT 3 WHERE NOT EXISTS (SELECT 1 FROM schema_version);
+	SELECT 4 WHERE NOT EXISTS (SELECT 1 FROM schema_version);
 `
 
 // vecSchema is record_vec, the optional projection behind the vector matcher.
@@ -177,9 +180,9 @@ func Open(path string) (*Store, error) {
 	}
 	// Refuse a file stamped with a schema_version we do not expect before
 	// anything touches it — no WAL, no schema write, no chmod. The recognized
-	// versions are 2 (the previous format, upgraded below) and the current one;
-	// a version-1 file stores ts in seconds, not nanoseconds, and reading it as
-	// current would silently show 1970.
+	// versions are 2 and 3 (previous formats, upgraded below) and the current
+	// one; a version-1 file stores ts in seconds, not nanoseconds, and reading
+	// it as current would silently show 1970.
 	v := 0
 	var stamped int
 	if err := db.QueryRow(`SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'schema_version'`).Scan(&stamped); err != nil {
@@ -191,7 +194,7 @@ func Open(path string) (*Store, error) {
 			db.Close()
 			return nil, fmt.Errorf("memstore: read schema_version from %s: %w", path, err)
 		}
-		if v != 2 && v != schemaVersion {
+		if v != 2 && v != 3 && v != schemaVersion {
 			db.Close()
 			return nil, fmt.Errorf("memstore: open %s: schema_version is %d, want %d (unix-nanosecond timestamps)", path, v, schemaVersion)
 		}
@@ -217,7 +220,7 @@ func Open(path string) (*Store, error) {
 	}
 	// A file already at the current version has its whole schema; applying it
 	// again would take the write lock on every open for nothing. Only a fresh or
-	// v2 file is brought to the current shape.
+	// older file is brought to the current shape.
 	if v != schemaVersion {
 		if _, err := db.Exec(schema); err != nil {
 			db.Close()
@@ -227,7 +230,7 @@ func Open(path string) (*Store, error) {
 		// upgrade is additive, guarded step by step by what already exists, so it
 		// is safe whenever the schema is applied: the missing columns are added
 		// with their v3 definition, the fs_node index is created, and the version
-		// row moves to 3. Existing rows are untouched — their origin picks up the
+		// row moves to 4. Existing rows are untouched — their origin picks up the
 		// column's default 'native'.
 		for _, add := range []struct{ col, ddl string }{
 			{"origin", "TEXT NOT NULL DEFAULT 'native'"},
@@ -251,7 +254,34 @@ func Open(path string) (*Store, error) {
 			db.Close()
 			return nil, fmt.Errorf("memstore: upgrade %s: %w", path, err)
 		}
-		if _, err := db.Exec(`UPDATE schema_version SET version = ? WHERE version = 2`, schemaVersion); err != nil {
+		// A file stamped 2 or 3 carries record_fts built with the default
+		// tokenizer, and FTS5 bakes the tokenizer into the table at CREATE.
+		// Drop and recreate the index with the porter stemmer, then rebuild it
+		// from memory: it is external content, so the rebuild re-derives the
+		// index from the stored text, never recopies it. The trigger is
+		// recreated with the table it writes.
+		if v == 2 || v == 3 {
+			for _, stmt := range []string{
+				`DROP TRIGGER IF EXISTS memory_ai`,
+				`DROP TABLE IF EXISTS record_fts`,
+				`CREATE VIRTUAL TABLE record_fts USING fts5(
+					title, text,
+					content = 'memory',
+					content_rowid = 'id',
+					tokenize = 'porter'
+				)`,
+				`CREATE TRIGGER memory_ai AFTER INSERT ON memory BEGIN
+					INSERT INTO record_fts(rowid, title, text) VALUES (new.id, new.title, new.text);
+				END`,
+				`INSERT INTO record_fts(record_fts) VALUES ('rebuild')`,
+			} {
+				if _, err := db.Exec(stmt); err != nil {
+					db.Close()
+					return nil, fmt.Errorf("memstore: rebuild record_fts in %s: %w", path, err)
+				}
+			}
+		}
+		if _, err := db.Exec(`UPDATE schema_version SET version = ? WHERE version IN (2, 3)`, schemaVersion); err != nil {
 			db.Close()
 			return nil, fmt.Errorf("memstore: upgrade %s: %w", path, err)
 		}
@@ -943,8 +973,9 @@ func scanMemory(sc scanner) (Memory, error) {
 }
 
 // ftsQuery turns free text into an FTS5 MATCH expression: one double-quoted
-// phrase per run of letters and digits, AND-joined. Quoting is what keeps a
-// user's query from being read as FTS5 syntax.
+// phrase per run of letters and digits, OR-joined. Quoting is what keeps a
+// user's query from being read as FTS5 syntax; OR is what keeps one absent
+// word from sinking a query whose other words match.
 func ftsQuery(q string) string {
 	var terms []string
 	for _, tok := range strings.FieldsFunc(q, func(r rune) bool {
@@ -952,7 +983,7 @@ func ftsQuery(q string) string {
 	}) {
 		terms = append(terms, `"`+tok+`"`)
 	}
-	return strings.Join(terms, " AND ")
+	return strings.Join(terms, " OR ")
 }
 
 // nullableId maps the zero id to NULL, which lets AUTOINCREMENT assign one.

@@ -200,8 +200,9 @@ func TestSecondPutSameIdRefused(t *testing.T) {
 	}
 }
 
-// Card section 1 / A1: a fresh store records schema_version 3 — the
-// unix-nanosecond timestamp format with the provenance columns — and opens.
+// Card section 1 / A1: a fresh store records schema_version 4 — the porter
+// tokenizer over the v3 format (unix-nanosecond timestamps with the provenance
+// columns) — and opens.
 func TestSchemaVersion(t *testing.T) {
 	s := openTemp(t)
 	db, err := sql.Open("sqlite", s.Path())
@@ -214,8 +215,8 @@ func TestSchemaVersion(t *testing.T) {
 	if err != nil {
 		t.Fatalf("SELECT schema_version: %v", err)
 	}
-	if v != 3 {
-		t.Errorf("schema_version = %d, want 3", v)
+	if v != 4 {
+		t.Errorf("schema_version = %d, want 4", v)
 	}
 }
 
@@ -224,9 +225,9 @@ func TestSchemaVersion(t *testing.T) {
 // were the current format. Each stamp gets its own fresh file so a refused
 // file never backs a later stage.
 func TestOpenRefusesUnexpectedSchemaVersion(t *testing.T) {
-	// 2 is recognized (upgraded) and 3 is current, so stamps 1 and 4 are the
-	// versions Open must refuse.
-	for _, stamp := range []int{1, 4} {
+	// 2 and 3 are recognized (upgraded) and 4 is current, so stamps 1 and 5 are
+	// the versions Open must refuse.
+	for _, stamp := range []int{1, 5} {
 		path := filepath.Join(t.TempDir(), "memory.db")
 		// A fresh store records the current version; stamp the row over.
 		s, err := memstore.Open(path)
@@ -735,7 +736,7 @@ func TestSearchWalkSurfacesEdges(t *testing.T) {
 		t.Fatalf("Link found-by: %v", err)
 	}
 
-	hits, err := s.Search("walkable-original", 5)
+	hits, err := s.Search("walkable", 5)
 	if err != nil {
 		t.Fatalf("Search: %v", err)
 	}
@@ -945,9 +946,97 @@ func TestPutWritesNativeProvenance(t *testing.T) {
 	}
 }
 
+// Card acceptance 5-6: a v3 file — record_fts built with the default
+// tokenizer — is upgraded on open: its rows survive, the index is rebuilt with
+// the porter stemmer, it stays external-content (no copy of the text), and the
+// version row reads 4.
+func TestV3StoreUpgradesToPorter(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "v3.db")
+	s, err := memstore.Open(path)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	id, err := s.Put(&memstore.Memory{Kind: "note", Text: "the release gates the merge"})
+	if err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+	s.Close()
+
+	// Downgrade the file to a genuine v3 index: record_fts rebuilt without the
+	// porter tokenizer (the default unicode61 tokenizer), version stamped 3.
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatalf("sql.Open: %v", err)
+	}
+	for _, stmt := range []string{
+		`DROP TRIGGER IF EXISTS memory_ai`,
+		`DROP TABLE IF EXISTS record_fts`,
+		`CREATE VIRTUAL TABLE record_fts USING fts5(title, text, content = 'memory', content_rowid = 'id')`,
+		`CREATE TRIGGER memory_ai AFTER INSERT ON memory BEGIN INSERT INTO record_fts(rowid, title, text) VALUES (new.id, new.title, new.text); END`,
+		`INSERT INTO record_fts(record_fts) VALUES ('rebuild')`,
+		`UPDATE schema_version SET version = 3`,
+	} {
+		if _, err := db.Exec(stmt); err != nil {
+			db.Close()
+			t.Fatalf("downgrade %q: %v", stmt, err)
+		}
+	}
+	var pre int
+	if err := db.QueryRow(`SELECT count(*) FROM record_fts WHERE record_fts MATCH '"gate"'`).Scan(&pre); err != nil {
+		db.Close()
+		t.Fatalf("MATCH on the v3 index: %v", err)
+	}
+	db.Close()
+	if pre != 0 {
+		t.Fatalf("the v3 fixture already answers a stemmed query (%d hits) — it is not an unstemmed index", pre)
+	}
+
+	up, err := memstore.Open(path)
+	if err != nil {
+		t.Fatalf("Open of a v3 file: %v, want the upgrade on open", err)
+	}
+	defer up.Close()
+
+	rdb, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatalf("sql.Open: %v", err)
+	}
+	defer rdb.Close()
+	var v int
+	if err := rdb.QueryRow(`SELECT version FROM schema_version`).Scan(&v); err != nil {
+		t.Fatalf("SELECT schema_version: %v", err)
+	}
+	if v != 4 {
+		t.Errorf("schema_version = %d after upgrade, want 4", v)
+	}
+	var shadow int
+	if err := rdb.QueryRow(`SELECT count(*) FROM sqlite_master WHERE name = 'record_fts_content'`).Scan(&shadow); err != nil {
+		t.Fatalf("sqlite_master: %v", err)
+	}
+	if shadow != 0 {
+		t.Error("record_fts_content exists after the rebuild — the text is being copied, not indexed in place")
+	}
+
+	// The row survives, and the rebuilt index answers the stem.
+	got, err := up.Get(id)
+	if err != nil {
+		t.Fatalf("Get of a pre-upgrade row: %v", err)
+	}
+	if got.Text != "the release gates the merge" {
+		t.Errorf("Text = %q, want the pre-upgrade bytes", got.Text)
+	}
+	hits, err := up.Search("gate", 5)
+	if err != nil {
+		t.Fatalf("Search(gate) after upgrade: %v", err)
+	}
+	if !containsID(hits, id) {
+		t.Errorf("Search(gate) after upgrade = %v, want %d — the porter index must answer the stem", ids(hits), id)
+	}
+}
+
 // Card 3 §1 / A1: a database stamped schema_version 2 — the previous format —
 // is upgraded on open, never refused: its rows stay readable, the missing
-// columns land with their v3 definitions, and the version row reads 3. The
+// columns land with their v3 definitions, and the version row reads 4. The
 // fixture is a genuine v2 file: the memory table is downgraded (the fs_node
 // index first, as SQLite requires) and the version row stamped back. A stamp
 // no longer recognized still refuses, as TestOpenRefusesUnexpectedSchemaVersion
@@ -998,8 +1087,8 @@ func TestV2StoreOpensAndUpgrades(t *testing.T) {
 	if err := rdb.QueryRow(`SELECT version FROM schema_version`).Scan(&v); err != nil {
 		t.Fatalf("SELECT schema_version: %v", err)
 	}
-	if v != 3 {
-		t.Errorf("schema_version = %d after upgrade, want 3", v)
+	if v != 4 {
+		t.Errorf("schema_version = %d after upgrade, want 4", v)
 	}
 	var cols int
 	if err := rdb.QueryRow(`SELECT count(*) FROM pragma_table_info('memory') WHERE name IN ('origin', 'origin_id', 'ref', 'fs_node')`).Scan(&cols); err != nil {
@@ -1340,16 +1429,15 @@ func containsID(ms []memstore.Memory, id int64) bool {
 	return false
 }
 
-// Spec AC3 / card section 4: with the stub embedder on, a query whose tokens
-// are not all present still finds the meaning-matching memory in the top 5;
-// with no embedder the same query finds nothing, because the lexical matcher
-// requires every token.
+// Card AC3 (re-anchored): a query that shares some but not all of a memory's
+// tokens is a lexical match once the index is stemmed and the query ORs — with
+// no embedder at all. The vector matcher is not needed for a partial lexical
+// overlap; it answers the zero-overlap query the fail-open half of AC3 names.
 func TestSearchFusesVectorRecall(t *testing.T) {
 	const q = "widget calibration procedure notes"
 	// Both rows carry the concept word zeta, which the query does not. A shares
 	// widget, calibration and notes with the query; B shares calibration and
-	// procedure. Neither carries every query token, so neither is a lexical
-	// match.
+	// procedure — a lexical handle either way, now that the query ORs stems.
 	fill := func(s *memstore.Store) int64 {
 		t.Helper()
 		if _, err := s.Put(&memstore.Memory{Kind: "note", Text: "widget calibration zeta notes"}); err != nil {
@@ -1364,10 +1452,12 @@ func TestSearchFusesVectorRecall(t *testing.T) {
 
 	off := openTemp(t)
 	fill(off)
-	if hits, err := off.Search(q, 5); err != nil {
+	hits, err := off.Search(q, 5)
+	if err != nil {
 		t.Fatalf("Search (vectors off): %v", err)
-	} else if len(hits) != 0 {
-		t.Errorf("Search (vectors off) = %d hits, want 0 — no memory carries every query token", len(hits))
+	}
+	if len(hits) != 2 {
+		t.Errorf("Search (vectors off) = %v, want both partial-overlap memories — AC3 re-anchored answers with no embedder", ids(hits))
 	}
 
 	on := openTemp(t)
@@ -1375,7 +1465,7 @@ func TestSearchFusesVectorRecall(t *testing.T) {
 		t.Fatalf("SetEmbedder: %v", err)
 	}
 	b := fill(on)
-	hits, err := on.Search(q, 5)
+	hits, err = on.Search(q, 5)
 	if err != nil {
 		t.Fatalf("Search (vectors on): %v", err)
 	}
@@ -1439,9 +1529,11 @@ func TestSearchWithoutVectorsIsLexical(t *testing.T) {
 }
 
 // Card acceptance 2: a db that already carries vectors opens fine without an
-// embedder and ignores them — the vector matcher is absent, not an error.
+// embedder and ignores them — the vector matcher is absent, so Search returns
+// exactly the lexical result, never an error and never a vector-only hit.
 func TestSearchIgnoresStoredVectorsWithoutEmbedder(t *testing.T) {
 	const q = "widget calibration procedure notes"
+	const row = "calibration procedure zeta handshake"
 	path := filepath.Join(t.TempDir(), "memory.db")
 	s, err := memstore.Open(path)
 	if err != nil {
@@ -1450,7 +1542,7 @@ func TestSearchIgnoresStoredVectorsWithoutEmbedder(t *testing.T) {
 	if err := s.SetEmbedder(stubEmbed(64)); err != nil {
 		t.Fatalf("SetEmbedder: %v", err)
 	}
-	b, err := s.Put(&memstore.Memory{Kind: "note", Text: "calibration procedure zeta handshake"})
+	b, err := s.Put(&memstore.Memory{Kind: "note", Text: row})
 	if err != nil {
 		t.Fatalf("Put: %v", err)
 	}
@@ -1468,15 +1560,28 @@ func TestSearchIgnoresStoredVectorsWithoutEmbedder(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Search (no embedder): %v", err)
 	}
-	if containsID(hits, b) {
-		t.Errorf("Search without an embedder found %d — stored vectors must be ignored, not searched", b)
+
+	// The same row with no stored vector: the two results must be identical,
+	// which is what "the stored vectors were ignored" means once the stemmed OR
+	// finds the row lexically anyway.
+	plain := openTemp(t)
+	if _, err := plain.Put(&memstore.Memory{Kind: "note", Text: row}); err != nil {
+		t.Fatalf("Put (plain): %v", err)
+	}
+	want, err := plain.Search(q, 5)
+	if err != nil {
+		t.Fatalf("Search (plain): %v", err)
+	}
+	if fmt.Sprint(ids(hits)) != fmt.Sprint(ids(want)) {
+		t.Errorf("Search without an embedder = %v, want the lexical result %v — stored vectors are ignored, not searched", ids(hits), ids(want))
 	}
 }
 
 // Card acceptance 4: the vector matcher must not demote a lexical bullseye.
-// The exact hit either carries no vector (written before the seam) and ties
-// the vector head — the lexical list wins the tie — or carries one too and
-// outranks the vector-only hit outright.
+// The exact hit is the lexical head; the other row shares stems with the query
+// and also carries a vector, and either way it must not displace the exact
+// match. The exact hit either carries no vector (written before the seam) or
+// carries one too.
 func TestSearchVectorDoesNotDemoteExactMatch(t *testing.T) {
 	const q = "widget calibration procedure report"
 
@@ -1653,8 +1758,8 @@ func TestImportEmbedsWhenConfigured(t *testing.T) {
 	if err := db.QueryRow(`SELECT version FROM schema_version`).Scan(&v); err != nil {
 		t.Fatalf("schema_version: %v", err)
 	}
-	if v != 3 {
-		t.Errorf("schema_version = %d with vectors on, want 3 (vectors are an enablement, not a format)", v)
+	if v != 4 {
+		t.Errorf("schema_version = %d with vectors on, want 4 (vectors are an enablement, not a format)", v)
 	}
 
 	plain := openTemp(t)

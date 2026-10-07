@@ -164,9 +164,12 @@ func (m *Matchers) vector(q string, k int) ([]int64, error) {
 const rrfK = 60
 
 // fuse merges the lexical and vector ranked lists into one order by
-// reciprocal rank fusion, at most k ids. A tie in fused score breaks to the
-// better rank, then to the lexical list, then to the lower id — so a vector
-// hit that merely ties the lexical head never displaces it, and the order is
+// reciprocal rank fusion, at most k ids. The vector list supplements lexical
+// recall: it contributes only the rows the lexical matcher did not rank, so a
+// partial lexical match cannot take a second vote and lift itself over the
+// lexical head — the exact match stays first, and the vector matcher keeps the
+// zero-lexical-overlap case it exists for. A tie breaks to the better rank,
+// then to the lexical list, then to the lower id, so the order is
 // deterministic. With an empty vector list the fused order is exactly the
 // lexical order.
 func fuse(lex, vec []int64, k int) []int64 {
@@ -194,7 +197,13 @@ func fuse(lex, vec []int64, k int) []int64 {
 		}
 	}
 	add(lex, true)
-	add(vec, false)
+	var vecOnly []int64
+	for _, id := range vec {
+		if _, ok := e[id]; !ok {
+			vecOnly = append(vecOnly, id)
+		}
+	}
+	add(vecOnly, false)
 
 	out := make([]int64, 0, len(e))
 	for id := range e {

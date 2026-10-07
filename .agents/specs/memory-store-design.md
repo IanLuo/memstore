@@ -1,5 +1,10 @@
-# System design — the memory store: one table, projections, fused recall
+<!-- specs:locked:5ec1768 2026-10-07 type=system-design -->
 
+## Link contract
+- **upstream** (this doc relies on): .agents/specs/memory-store.md
+- **referrers** (must cite this when they change): none
+
+# System design — the memory store: one table, projections, fused recall
 ## Components & ownership
 - **Store** — owns the `memory` table and its lifecycle. **Refuses:** search, ranking, telemetry.
 - **Projections** — owns FTS (+ optional vectors). **Refuses:** being the source of truth.
@@ -8,9 +13,11 @@
 - **Importer** — owns one-way ingest. **Refuses:** modifying rows that already exist.
 
 ## Data model
-- `memory`: `id · ts · kind · scope · title · text · extra · importance · tier · status · deleted_at · parent · supersedes · found_by · hash`.
+- `memory`: `id · ts · kind · scope · title · text · extra · importance · tier · status · deleted_at · parent · supersedes · found_by · hash · origin · origin_id · ref · fs_node`.
+- Provenance (added for `import`, slice 3 — additive columns, carried in at `schema_version` 3): `origin` (native|imported) · `origin_id` (the source's event id, import-unique) · `ref` (commit sha) · `fs_node` (the source's node key). A v2 file upgrades additively on open; a v1 (`5aa287a`) file is refused.
+- **A schema change reaches an existing file only through a `schema_version` bump.** `Open` applies the schema, the provenance `ALTER` probes and the `fs_node` index only when the file's version is not current — that is what leaves an already-current file taking no write lock on open, which is what lets a reader race a writer. An additive table or column added without a bump therefore lands in a new file and nowhere else: bump `schema_version` when the shape changes, because the version check is what carries the change in. (Slice 2's `edge` table landed under the earlier rule, where `schema` ran on every open; that rule is gone.) The current version is 4: v3 → 4 is the porter index's rebuild, carried in by the same check.
 - Immutable: content (`id`…`text`, `extra`). Mutable: `status`, `deleted_at`, `tier` — the one narrow exception to append-only, and what removes the need for event rows.
-- `record_fts`: FTS5 external-content over (`title`,`text`) — no copy of the text.
+- `record_fts`: FTS5 external-content over (`title`,`text`) — no copy of the text. The `porter` tokenizer is baked into the table at CREATE, so raising the format from v3 to v4 drops and rebuilds the index from `memory` on open (the index is re-derived from the content table, never recopied).
 - `record_vec`: optional (`id`, `vector`).
 - No event rows: a record's state is a column, not another row.
 - Edge input: empty `text` rejected; unknown `kind` stored (open label).
