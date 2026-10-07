@@ -1,4 +1,4 @@
-<!-- specs:locked:b3e5e0c 2026-10-07 type=spec -->
+<!-- specs:locked:c249bfc 2026-10-08 type=spec -->
 
 ## Link contract
 - **upstream** (this doc relies on): none
@@ -33,13 +33,13 @@
 - Empty input: a `put` with empty `text` is rejected; the smallest accepted input is non-empty `text` + `kind`.
 
 ## KPIs & failure signal
-- **Good:** top-5 recall ≥ target on a held-out query set; p95 `search` < 50 ms at 10⁴ memories; size — the text is stored once; measured db/text ≈1.3× on a bulk payload and ≈4.36× @10³, ≈3.57× @10⁴ on the small-row corpus (the overhead is the index and the row columns; measured by `cmd/bench`).
+- **Good:** top-5 recall ≥ target on a held-out query set; p95 `search` < 50 ms at 10⁴ memories; size — the text is stored once; measured db/text ≈4.36× @10³ and ≈3.57× @10⁴ on `cmd/bench`'s synthetic small-row corpus (~84 B per memory), where the overhead is the index and the row columns. **No bulk-payload ratio is measured:** the ≈1.3× that stood here had no measurement behind it and is withdrawn rather than restated.
 - **Off-switch:** recall no better than `grep` on the same corpus — then the fused matcher was not worth its complexity.
 
 ## Non-functional requirements
-- Performance: open < 50 ms; `search` p95 < 50 ms at 10⁴ memories. The 10× p95 ratio is a measured observation, not a bound: 1.786× with the AND query at `5ec1768` (p95 0.393 ms), 3.778× with the OR query at `b3e5e0c` (p95 1.664 ms). OR over the query's stems saturates hits per query at k=10, so bm25 scores a candidate set that grows with N, where the AND query returned almost nothing (evidence: memstore:t-d2c7acc3).
+- Performance: open < 50 ms; `search` p95 < 50 ms at 10⁴ memories. The 10× p95 ratio is a measured observation, not a bound: 1.786× with the AND query at `5ec1768` (p95 0.393 ms), 3.778× with the OR query at `b3e5e0c` (p95 1.664 ms). OR over the query's stems saturates hits per query at k=10, so bm25 scores a candidate set that grows with N, where the AND query returned almost nothing. **Evidence, per revision** — the AND-era figures are `memstore:t-d2c7acc3` (the probe run at `d735e3f`, which measured 1.867× and 0.423 ms); the OR figures and the cause are the independent review of `b3e5e0c`, `cap:t-ab50a7ad` (worker `memstore:t-4db2eb42`).
 - Portability: one file, offline, no server.
-- Size: the text is stored once — FTS is external-content, never a copy; measured total bytes ≈1.3× the text on a bulk payload and ≈4.36× at 10³, ≈3.57× at 10⁴ on the small-row corpus (the overhead is the index and the row columns).
+- Size: the text is stored once — FTS is external-content, never a copy; measured total bytes ≈4.36× at 10³ and ≈3.57× at 10⁴ on the small-row corpus (the overhead is the index and the row columns). **No bulk-payload ratio is measured;** the ≈1.3× figure that stood here is withdrawn, and the same false attribution was corrected in the KPIs above.
 - Durability: content append-only; a crash loses nothing already written.
 - Cost: no external service.
 
