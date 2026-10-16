@@ -87,6 +87,13 @@ type Store struct {
 // the INSERT literal in schema equal to this; TestSchemaVersion pins both.
 const schemaVersion = 4
 
+// busyTimeout is how long a statement waits for the file's write lock before
+// it fails. It is named once because two places set the same bound — the
+// connection's busy_timeout, which SQLite applies to every statement, and
+// switchToWAL's retry loop, which exists because SQLite does not apply the
+// handler to a journal-mode change. Written twice, they could drift.
+const busyTimeout = 5 * time.Second
+
 // schema is the whole database. record_fts is FTS5 external content over
 // memory (title, text), tokenized by the porter stemmer so a query reaches a
 // stored word's inflections ("gate" reaches "gates"): the text is indexed in
@@ -182,7 +189,7 @@ func Open(path string) (*Store, error) {
 	// lock instead of failing, which SetMaxOpenConns cannot do — the CLI is a
 	// new process per command.
 	db.SetMaxOpenConns(1)
-	if _, err := db.Exec(`PRAGMA busy_timeout = 5000;`); err != nil {
+	if _, err := db.Exec(fmt.Sprintf(`PRAGMA busy_timeout = %d;`, busyTimeout.Milliseconds())); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("memstore: configure %s: %w", path, err)
 	}
@@ -230,7 +237,21 @@ func Open(path string) (*Store, error) {
 	// again would take the write lock on every open for nothing. Only a fresh or
 	// older file is brought to the current shape.
 	if v != schemaVersion {
-		if _, err := db.Exec(schema); err != nil {
+		// schema creates schema_version's table and its row in two separate
+		// statements. Applied in one transaction they become visible together,
+		// so a concurrent opener never reads the table before its row exists —
+		// the half state that failed it with "sql: no rows in result set".
+		tx, err := db.Begin()
+		if err != nil {
+			db.Close()
+			return nil, fmt.Errorf("memstore: apply schema to %s: %w", path, err)
+		}
+		if _, err := tx.Exec(schema); err != nil {
+			tx.Rollback()
+			db.Close()
+			return nil, fmt.Errorf("memstore: apply schema to %s: %w", path, err)
+		}
+		if err := tx.Commit(); err != nil {
 			db.Close()
 			return nil, fmt.Errorf("memstore: apply schema to %s: %w", path, err)
 		}
@@ -324,7 +345,7 @@ func Open(path string) (*Store, error) {
 // gives every other statement. A refusal that is not SQLITE_BUSY is returned
 // at once, so an unwritable file still fails open fast.
 func switchToWAL(db *sql.DB) error {
-	deadline := time.Now().Add(5 * time.Second)
+	deadline := time.Now().Add(busyTimeout)
 	for {
 		_, err := db.Exec(`PRAGMA journal_mode = WAL;`)
 		if err == nil {
