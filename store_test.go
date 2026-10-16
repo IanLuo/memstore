@@ -362,6 +362,101 @@ func TestConcurrentOpensOnFreshFile(t *testing.T) {
 	}
 }
 
+// writeV3File writes a genuine v3 file at path: one row, record_fts built with
+// the default tokenizer (no porter), schema_version stamped 3 — the fixture
+// recipe TestV3StoreUpgradesToPorter uses, rebuilt per round below.
+func writeV3File(t *testing.T, path string) {
+	t.Helper()
+	s, err := memstore.Open(path)
+	if err != nil {
+		t.Fatalf("writeV3File Open: %v", err)
+	}
+	if _, err := s.Put(&memstore.Memory{Kind: "note", Text: "the release gates the merge"}); err != nil {
+		t.Fatalf("writeV3File Put: %v", err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatalf("writeV3File Close: %v", err)
+	}
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatalf("writeV3File sql.Open: %v", err)
+	}
+	defer db.Close()
+	for _, stmt := range []string{
+		`DROP TRIGGER IF EXISTS memory_ai`,
+		`DROP TABLE IF EXISTS record_fts`,
+		`CREATE VIRTUAL TABLE record_fts USING fts5(title, text, content = 'memory', content_rowid = 'id')`,
+		`CREATE TRIGGER memory_ai AFTER INSERT ON memory BEGIN INSERT INTO record_fts(rowid, title, text) VALUES (new.id, new.title, new.text); END`,
+		`INSERT INTO record_fts(record_fts) VALUES ('rebuild')`,
+		`UPDATE schema_version SET version = 3`,
+	} {
+		if _, err := db.Exec(stmt); err != nil {
+			t.Fatalf("writeV3File downgrade %q: %v", stmt, err)
+		}
+	}
+}
+
+// Card acceptance 1: openers that start *together* on a genuine v3 file. The
+// upgrade after the schema is one transaction and re-reads schema_version under
+// its write lock, so a second opener that read v3 before the winner committed
+// finds version 4 and does nothing. Before that fix the loser replayed the
+// rebuild outside any transaction and died on its own CREATE TRIGGER memory_ai
+// already exists — a failure a staggered test never sees.
+func TestConcurrentOpensOnV3File(t *testing.T) {
+	const rounds = 50
+	const openers = 5
+	for round := 0; round < rounds; round++ {
+		path := filepath.Join(t.TempDir(), "v3.db")
+		writeV3File(t, path)
+
+		// One barrier: every opener is released into Open at the same instant,
+		// so they all read version 3 before any of them commits the upgrade.
+		start := make(chan struct{})
+		errs := make([]error, openers)
+		var wg sync.WaitGroup
+		for i := 0; i < openers; i++ {
+			wg.Add(1)
+			go func(i int) {
+				defer wg.Done()
+				<-start
+				s, err := memstore.Open(path)
+				if err == nil {
+					err = s.Close()
+				}
+				errs[i] = err
+			}(i)
+		}
+		close(start)
+		wg.Wait()
+		for i, err := range errs {
+			if err != nil {
+				t.Fatalf("round %d, opener %d: %v", round, i, err)
+			}
+		}
+
+		db, err := sql.Open("sqlite", path)
+		if err != nil {
+			t.Fatalf("round %d: sql.Open: %v", round, err)
+		}
+		var v, n int
+		verr := db.QueryRow(`SELECT version FROM schema_version`).Scan(&v)
+		rerr := db.QueryRow(`SELECT count(*) FROM memory`).Scan(&n)
+		db.Close()
+		if verr != nil {
+			t.Fatalf("round %d: SELECT schema_version: %v", round, verr)
+		}
+		if rerr != nil {
+			t.Fatalf("round %d: count rows: %v", round, rerr)
+		}
+		if v != 4 {
+			t.Fatalf("round %d: schema_version = %d after concurrent open, want 4", round, v)
+		}
+		if n != 1 {
+			t.Fatalf("round %d: rows = %d, want 1 (the seed row must survive the rebuild)", round, n)
+		}
+	}
+}
+
 // Card acceptance: the file written is the file the caller named. The DSN used
 // to be the path concatenated with "?_txlock=immediate", so the driver ended
 // the filename at the first '?' and Open reported success on a different file.

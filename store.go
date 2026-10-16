@@ -237,82 +237,116 @@ func Open(path string) (*Store, error) {
 	// again would take the write lock on every open for nothing. Only a fresh or
 	// older file is brought to the current shape.
 	if v != schemaVersion {
-		// schema creates schema_version's table and its row in two separate
-		// statements. Applied in one transaction they become visible together,
-		// so a concurrent opener never reads the table before its row exists —
-		// the half state that failed it with "sql: no rows in result set".
+		// The schema and the upgrade that follows it are the one transaction,
+		// and the version is re-read inside it. Begin is IMMEDIATE (the DSN's
+		// _txlock), so the write lock is held from here: a second opener that
+		// read an old version before the winner committed waits on that lock,
+		// re-reads the current version and does nothing — without the re-read it
+		// replayed the rebuild outside any transaction and died on its own
+		// CREATE TRIGGER memory_ai already exists. One transaction also makes
+		// schema_version's table and its row visible together, so a concurrent
+		// opener never reads the table before its row exists — the half state
+		// that failed it with "sql: no rows in result set".
 		tx, err := db.Begin()
 		if err != nil {
 			db.Close()
 			return nil, fmt.Errorf("memstore: apply schema to %s: %w", path, err)
 		}
-		if _, err := tx.Exec(schema); err != nil {
+		// Re-read under the lock: v was read before Begin, so it is stale if
+		// another opener reached the current version first. A file whose
+		// schema_version table is present and current needs nothing — the
+		// second opener does not replay the upgrade; a fresh file (no table)
+		// still gets the schema and the fs_node index.
+		var had int
+		if err := tx.QueryRow(`SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'schema_version'`).Scan(&had); err != nil {
 			tx.Rollback()
 			db.Close()
-			return nil, fmt.Errorf("memstore: apply schema to %s: %w", path, err)
+			return nil, fmt.Errorf("memstore: read %s: %w", path, err)
+		}
+		cur := 0
+		if had == 1 {
+			if err := tx.QueryRow(`SELECT version FROM schema_version`).Scan(&cur); err != nil {
+				tx.Rollback()
+				db.Close()
+				return nil, fmt.Errorf("memstore: read schema_version from %s: %w", path, err)
+			}
+		}
+		if had == 0 || cur != schemaVersion {
+			if _, err := tx.Exec(schema); err != nil {
+				tx.Rollback()
+				db.Close()
+				return nil, fmt.Errorf("memstore: apply schema to %s: %w", path, err)
+			}
+			// A file stamped schema_version 2 predates the provenance columns;
+			// a fresh file gets them from the schema just applied. The upgrade
+			// is additive, guarded step by step by what already exists: the
+			// missing columns are added with their v3 definition, the fs_node
+			// index is created, and the version row moves to 4. Existing rows
+			// are untouched — their origin picks up the column's default
+			// 'native'.
+			for _, add := range []struct{ col, ddl string }{
+				{"origin", "TEXT NOT NULL DEFAULT 'native'"},
+				{"origin_id", "TEXT"},
+				{"ref", "TEXT"},
+				{"fs_node", "TEXT"},
+			} {
+				var have int
+				if err := tx.QueryRow(`SELECT count(*) FROM pragma_table_info('memory') WHERE name = ?`, add.col).Scan(&have); err != nil {
+					tx.Rollback()
+					db.Close()
+					return nil, fmt.Errorf("memstore: upgrade %s: %w", path, err)
+				}
+				if have == 0 {
+					if _, err := tx.Exec(`ALTER TABLE memory ADD COLUMN ` + add.col + ` ` + add.ddl); err != nil {
+						tx.Rollback()
+						db.Close()
+						return nil, fmt.Errorf("memstore: upgrade %s: %w", path, err)
+					}
+				}
+			}
+			if _, err := tx.Exec(`CREATE INDEX IF NOT EXISTS idx_memory_fs_node ON memory(fs_node)`); err != nil {
+				tx.Rollback()
+				db.Close()
+				return nil, fmt.Errorf("memstore: upgrade %s: %w", path, err)
+			}
+			// A file stamped 2 or 3 carries record_fts built with the default
+			// tokenizer, and FTS5 bakes the tokenizer into the table at CREATE.
+			// Drop and recreate the index with the porter stemmer, then rebuild
+			// it from memory: it is external content, so the rebuild re-derives
+			// the index from the stored text, never recopies it. The trigger is
+			// recreated with the table it writes; IF NOT EXISTS matches const
+			// schema, so the rebuild stays idempotent even if it is re-entered.
+			if cur == 2 || cur == 3 {
+				for _, stmt := range []string{
+					`DROP TRIGGER IF EXISTS memory_ai`,
+					`DROP TABLE IF EXISTS record_fts`,
+					`CREATE VIRTUAL TABLE record_fts USING fts5(
+						title, text,
+						content = 'memory',
+						content_rowid = 'id',
+						tokenize = 'porter'
+					)`,
+					`CREATE TRIGGER IF NOT EXISTS memory_ai AFTER INSERT ON memory BEGIN
+						INSERT INTO record_fts(rowid, title, text) VALUES (new.id, new.title, new.text);
+					END`,
+					`INSERT INTO record_fts(record_fts) VALUES ('rebuild')`,
+				} {
+					if _, err := tx.Exec(stmt); err != nil {
+						tx.Rollback()
+						db.Close()
+						return nil, fmt.Errorf("memstore: rebuild record_fts in %s: %w", path, err)
+					}
+				}
+			}
+			if _, err := tx.Exec(`UPDATE schema_version SET version = ? WHERE version IN (2, 3)`, schemaVersion); err != nil {
+				tx.Rollback()
+				db.Close()
+				return nil, fmt.Errorf("memstore: upgrade %s: %w", path, err)
+			}
 		}
 		if err := tx.Commit(); err != nil {
 			db.Close()
 			return nil, fmt.Errorf("memstore: apply schema to %s: %w", path, err)
-		}
-		// A file stamped schema_version 2 predates the provenance columns. The
-		// upgrade is additive, guarded step by step by what already exists, so it
-		// is safe whenever the schema is applied: the missing columns are added
-		// with their v3 definition, the fs_node index is created, and the version
-		// row moves to 4. Existing rows are untouched — their origin picks up the
-		// column's default 'native'.
-		for _, add := range []struct{ col, ddl string }{
-			{"origin", "TEXT NOT NULL DEFAULT 'native'"},
-			{"origin_id", "TEXT"},
-			{"ref", "TEXT"},
-			{"fs_node", "TEXT"},
-		} {
-			var have int
-			if err := db.QueryRow(`SELECT count(*) FROM pragma_table_info('memory') WHERE name = ?`, add.col).Scan(&have); err != nil {
-				db.Close()
-				return nil, fmt.Errorf("memstore: upgrade %s: %w", path, err)
-			}
-			if have == 0 {
-				if _, err := db.Exec(`ALTER TABLE memory ADD COLUMN ` + add.col + ` ` + add.ddl); err != nil {
-					db.Close()
-					return nil, fmt.Errorf("memstore: upgrade %s: %w", path, err)
-				}
-			}
-		}
-		if _, err := db.Exec(`CREATE INDEX IF NOT EXISTS idx_memory_fs_node ON memory(fs_node)`); err != nil {
-			db.Close()
-			return nil, fmt.Errorf("memstore: upgrade %s: %w", path, err)
-		}
-		// A file stamped 2 or 3 carries record_fts built with the default
-		// tokenizer, and FTS5 bakes the tokenizer into the table at CREATE.
-		// Drop and recreate the index with the porter stemmer, then rebuild it
-		// from memory: it is external content, so the rebuild re-derives the
-		// index from the stored text, never recopies it. The trigger is
-		// recreated with the table it writes.
-		if v == 2 || v == 3 {
-			for _, stmt := range []string{
-				`DROP TRIGGER IF EXISTS memory_ai`,
-				`DROP TABLE IF EXISTS record_fts`,
-				`CREATE VIRTUAL TABLE record_fts USING fts5(
-					title, text,
-					content = 'memory',
-					content_rowid = 'id',
-					tokenize = 'porter'
-				)`,
-				`CREATE TRIGGER memory_ai AFTER INSERT ON memory BEGIN
-					INSERT INTO record_fts(rowid, title, text) VALUES (new.id, new.title, new.text);
-				END`,
-				`INSERT INTO record_fts(record_fts) VALUES ('rebuild')`,
-			} {
-				if _, err := db.Exec(stmt); err != nil {
-					db.Close()
-					return nil, fmt.Errorf("memstore: rebuild record_fts in %s: %w", path, err)
-				}
-			}
-		}
-		if _, err := db.Exec(`UPDATE schema_version SET version = ? WHERE version IN (2, 3)`, schemaVersion); err != nil {
-			db.Close()
-			return nil, fmt.Errorf("memstore: upgrade %s: %w", path, err)
 		}
 	}
 	// The store is user-only: the file and its WAL sidecars hold memory text,
