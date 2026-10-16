@@ -1,4 +1,4 @@
-<!-- specs:locked:f61295a 2026-10-16 type=spec -->
+<!-- specs:locked:54c1ad8 2026-10-16 type=spec -->
 
 ## Link contract
 - **upstream** (this doc relies on): none
@@ -30,6 +30,7 @@
 - GIVEN a memory and a query that shares at least one stemmed term with it — an inflected form, or one token of several — WHEN `search q k=5` THEN the memory is in the top 5, best first; with no shared stem and no embedder configured, the store returns fewer results, never a wrong one.
 - GIVEN `forget(id)` WHEN `get(id)` THEN the row is hidden from reads and its bytes remain.
 - GIVEN a 10× corpus WHEN `search` runs THEN p95 < 50 ms at 10⁴ memories (the absolute bound; the 10× ratio is a measured observation, not a bound — see Non-functional requirements).
+- GIVEN a store file that does not exist WHEN two processes open it and write at once THEN both succeed and every write is present.
 - Empty input: a `put` with empty `text` is rejected; the smallest accepted input is non-empty `text` + `kind`.
 
 ## KPIs & failure signal
@@ -41,10 +42,11 @@
 - Portability: one file, offline, no server.
 - Size: the text is stored once — FTS is external-content, never a copy; measured total bytes ≈4.36× at 10³ and ≈3.57× at 10⁴ on the small-row corpus (the overhead is the index and the row columns). **No bulk-payload ratio is measured;** the ≈1.3× figure that stood here is withdrawn, and the same false attribution was corrected in the KPIs above.
 - Durability: content append-only; a crash loses nothing already written.
+- Concurrency: several processes may open the store, including the first creation of the file; a caller waits for the lock rather than failing, and no write is lost.
 - Cost: no external service.
 
 ## Assumptions & dependencies
-- Single user, local, no server. *Invalidated by:* multi-writer.
+- One writer at a time: single user, local, no server, and several processes may open the file — each waits its turn rather than failing. *Invalidated by:* multi-writer.
 - SQLite with FTS5 present. *Invalidated by:* a store that must be remote.
 - Blurry works with no model (lexical ∪ graph); vectors optional. *Invalidated by:* requiring semantic recall with no model.
 - Import source is fs's store; designed-for, not blocking. *Invalidated by:* fs's schema changing shape.
