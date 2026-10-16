@@ -311,6 +311,110 @@ func TestConcurrentWritersQueue(t *testing.T) {
 	}
 }
 
+// Card acceptance: two openers racing a *fresh* file. The first write Open
+// makes to a new file is the journal-mode switch, which takes an exclusive
+// lock, and SQLite does not run the busy timeout for a journal-mode change —
+// so a second opener was refused with SQLITE_BUSY. TestConcurrentWritersQueue
+// cannot see this: it opens the first handle to completion before the second.
+func TestConcurrentOpensOnFreshFile(t *testing.T) {
+	const rounds = 30
+	const openers = 2
+	for round := 0; round < rounds; round++ {
+		path := filepath.Join(t.TempDir(), "memory.db")
+		start := make(chan struct{})
+		errs := make([]error, openers)
+		var wg sync.WaitGroup
+		for i := 0; i < openers; i++ {
+			wg.Add(1)
+			go func(i int) {
+				defer wg.Done()
+				<-start
+				s, err := memstore.Open(path)
+				if err == nil {
+					_, err = s.Put(&memstore.Memory{Kind: "note", Text: fmt.Sprintf("opener %d", i)})
+					if cerr := s.Close(); err == nil {
+						err = cerr
+					}
+				}
+				errs[i] = err
+			}(i)
+		}
+		close(start)
+		wg.Wait()
+		for i, err := range errs {
+			if err != nil {
+				t.Fatalf("round %d, opener %d: %v", round, i, err)
+			}
+		}
+		rdb, err := sql.Open("sqlite", path)
+		if err != nil {
+			t.Fatalf("round %d: sql.Open: %v", round, err)
+		}
+		var n int
+		if err := rdb.QueryRow(`SELECT count(*) FROM memory`).Scan(&n); err != nil {
+			rdb.Close()
+			t.Fatalf("round %d: count rows: %v", round, err)
+		}
+		rdb.Close()
+		if n != openers {
+			t.Fatalf("round %d: stored rows = %d, want %d", round, n, openers)
+		}
+	}
+}
+
+// Card acceptance: the file written is the file the caller named. The DSN used
+// to be the path concatenated with "?_txlock=immediate", so the driver ended
+// the filename at the first '?' and Open reported success on a different file.
+func TestOpenPathWithQuestionMark(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "path?q", "memory.db")
+	s, err := memstore.Open(path)
+	if err != nil {
+		t.Fatalf("Open(%q): %v", path, err)
+	}
+	defer s.Close()
+	id, err := s.Put(&memstore.Memory{Kind: "note", Text: "at the named path"})
+	if err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("the file the caller named was not written: %v", err)
+	}
+	again, err := memstore.Open(path)
+	if err != nil {
+		t.Fatalf("reopen(%q): %v", path, err)
+	}
+	defer again.Close()
+	if _, err := again.Get(id); err != nil {
+		t.Errorf("Get(%d) after reopen: %v", id, err)
+	}
+}
+
+// A relative path stays relative to the caller's working directory. This rides
+// with the DSN change: a "file:" URI that carries the path as an authority
+// (/path read as //host/) opens a different file and reports success.
+func TestOpenRelativePath(t *testing.T) {
+	dir := t.TempDir()
+	wd, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chdir(dir); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.Chdir(wd) })
+	s, err := memstore.Open(filepath.Join("sub", "memory.db"))
+	if err != nil {
+		t.Fatalf("Open(relative): %v", err)
+	}
+	defer s.Close()
+	if _, err := s.Put(&memstore.Memory{Kind: "note", Text: "relative"}); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "sub", "memory.db")); err != nil {
+		t.Errorf("the file was not created relative to the working directory: %v", err)
+	}
+}
+
 // Get of an id that was never put is an error, not a zero memory.
 func TestGetMissingId(t *testing.T) {
 	s := openTemp(t)

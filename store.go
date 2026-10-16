@@ -12,13 +12,15 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
 	"time"
 	"unicode"
 
-	_ "modernc.org/sqlite"
+	"modernc.org/sqlite"
+	sqlite3 "modernc.org/sqlite/lib"
 )
 
 // Memory is one row of the memory table, the store's only source of truth.
@@ -160,12 +162,18 @@ func Open(path string) (*Store, error) {
 			return nil, fmt.Errorf("memstore: create %s: %w", dir, err)
 		}
 	}
+	// The DSN is a file: URI with the path escaped, so that a '?' or '#' in it
+	// is data rather than the start of the parameters: the driver ends the
+	// filename at the first '?', and a concatenated DSN wrote a different file
+	// than the caller named while Open reported success. OmitHost keeps a
+	// relative path from being read as the URI's authority.
 	// _txlock=immediate makes every transaction take the write lock at BEGIN.
 	// A deferred transaction that reads before it writes is refused with
 	// SQLITE_BUSY when another writer got there first, and SQLite does not run
 	// the busy timeout for that upgrade, so the timeout alone would not make
 	// writers queue.
-	db, err := sql.Open("sqlite", path+"?_txlock=immediate")
+	dsn := (&url.URL{Scheme: "file", Path: path, OmitHost: true, RawQuery: "_txlock=immediate"}).String()
+	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("memstore: open %s: %w", path, err)
 	}
@@ -209,7 +217,7 @@ func Open(path string) (*Store, error) {
 		return nil, fmt.Errorf("memstore: configure %s: %w", path, err)
 	}
 	if !strings.EqualFold(mode, "wal") {
-		if _, err := db.Exec(`PRAGMA journal_mode = WAL;`); err != nil {
+		if err := switchToWAL(db); err != nil {
 			db.Close()
 			return nil, fmt.Errorf("memstore: configure %s: %w", path, err)
 		}
@@ -305,6 +313,29 @@ func Open(path string) (*Store, error) {
 	// implements matchReader without exposing its write side.
 	s.matchers.reader = s
 	return s, nil
+}
+
+// switchToWAL puts db's file in WAL mode. The switch takes the file's
+// exclusive lock, and SQLite does not run the busy timeout for a journal-mode
+// change, so a second opener racing a fresh file is refused with SQLITE_BUSY
+// instead of waiting. The refusal is not a failure: another opener is making
+// the same switch, the mode is stored in the file, and a retry succeeds once
+// that switch has released the lock. Bounded by the same 5 s the busy timeout
+// gives every other statement. A refusal that is not SQLITE_BUSY is returned
+// at once, so an unwritable file still fails open fast.
+func switchToWAL(db *sql.DB) error {
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		_, err := db.Exec(`PRAGMA journal_mode = WAL;`)
+		if err == nil {
+			return nil
+		}
+		var se *sqlite.Error
+		if !errors.As(err, &se) || (se.Code()&0xff) != sqlite3.SQLITE_BUSY || time.Now().After(deadline) {
+			return err
+		}
+		time.Sleep(time.Millisecond)
+	}
 }
 
 // tsMin and tsMax are the true bounds of the unix-nanosecond range time.Time
