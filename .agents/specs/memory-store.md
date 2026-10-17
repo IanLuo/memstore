@@ -1,4 +1,4 @@
-<!-- specs:locked:54c1ad8 2026-10-16 type=spec -->
+<!-- specs:locked:9586fa7 2026-10-16 type=spec -->
 
 ## Link contract
 - **upstream** (this doc relies on): none
@@ -26,6 +26,7 @@
 
 ## Acceptance criteria
 - GIVEN an empty store WHEN `put` a memory THEN `get` returns it with byte-identical text and an equal timestamp (the zone normalises to UTC; the instant is preserved at nanosecond resolution).
+- GIVEN a `put` carrying `origin`, `origin_id`, `ref` and `fs_node` WHEN `get` THEN the four fields round-trip; an empty field is stored NULL and an empty `origin` becomes `native`. GIVEN a memory with `(origin, origin_id)` WHEN `put` the same pair again THEN it is refused with `ErrDuplicateOrigin` and the file still holds one row; the same `origin_id` under a different `origin` is accepted. GIVEN a `schema_version`-4 file WHEN opened THEN it reports 5, carries the partial unique index, and keeps its rows; a file with pre-existing duplicate `('imported', id)` rows fails `Open` loudly, naming the index.
 - GIVEN D1 and D2 where `supersedes(D1)=D2` WHEN `search` finds D1 THEN the result carries D2's id.
 - GIVEN a memory and a query that shares at least one stemmed term with it — an inflected form, or one token of several — WHEN `search q k=5` THEN the memory is in the top 5, best first; with no shared stem and no embedder configured, the store returns fewer results, never a wrong one.
 - GIVEN `forget(id)` WHEN `get(id)` THEN the row is hidden from reads and its bytes remain.
@@ -52,7 +53,7 @@
 - Import source is fs's store; designed-for, not blocking. *Invalidated by:* fs's schema changing shape.
 
 ## Data requirements
-- **Inputs:** memories — `kind`, `scope`, `text`, optional `extra` and relations.
+- **Inputs:** memories — `kind`, `scope`, `text`, optional `extra`, provenance (`origin`, `origin_id`, `ref`, `fs_node`) and relations.
 - **Outputs:** ranked list (`search`), one by id (`get`), recent list, `stats`.
 - **Must survive:** claims (decisions, knowledge, goals) forever; content immutable.
 - Empty record: rejected (empty `text`); unknown `kind` accepted (open label).
@@ -69,5 +70,6 @@
 
 ## Verification plan
 - Each acceptance bullet → an automated test over a fixture corpus.
+- The provenance contract → round-trip, NULL, duplicate, coexistence, barrier and v4-upgrade tests; the index's refusal over pre-existing duplicates is asserted as a returned error naming the index, not a crash.
 - NFRs → a benchmark at 1× and 10×, plus a measured size ratio.
 - Retrieval quality → a held-out query set, scored in CI.

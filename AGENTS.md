@@ -44,9 +44,15 @@ nix develop --command go run ./cmd/bench
   mistaken forget needs raw SQL.
 - **FTS is external-content**: the text is stored once, never copied into the index;
   the index is tokenized by the porter stemmer.
-- **`schema_version` is 4.** The porter tokenizer is baked into `record_fts` at
+- **`schema_version` is 5.** The porter tokenizer is baked into `record_fts` at
   CREATE, so `Open` rebuilds the index from `memory` when it upgrades a v3 (or v2)
-  file; a v1 file is refused rather than silently read as 1970.
+  file; a v1 file is refused rather than silently read as 1970. v4 → 5 adds the
+  partial unique index on `(origin, origin_id)` and changes nothing else.
+- **Provenance is content, and `(origin, origin_id)` is unique when it is set.**
+  `Put` writes the four fields it is handed — an empty `origin` becomes `native`,
+  and an empty `origin_id`, `ref` or `fs_node` becomes NULL — and refuses a
+  duplicate pair with `ErrDuplicateOrigin`, so a caller decides whether a re-run
+  is a skip. The index is partial: NULL `origin_id` never collides.
 - **One writer at a time.** One local file, no server, no network.
 - **A commit invalidates the locked specs.** `check-specs.sh` measures the whole
   project, so any commit past the sha a marker names refuses the `code` entry gate;
@@ -56,7 +62,8 @@ nix develop --command go run ./cmd/bench
 
 Store owns the `memory` table and its lifecycle, and refuses search and ranking.
 Matchers own recall fusion and refuse writing. The CLI owns the verb surface and
-refuses business logic. The Importer is the only writer of the provenance columns.
+refuses business logic. `Put` and the Importer both write the provenance columns,
+from opposite directions: a caller's value, or fs's event.
 
 ```
 cmd/memstore/     — the CLI: parse args, call the store, print JSON. No logic.

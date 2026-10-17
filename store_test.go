@@ -191,6 +191,9 @@ func TestSecondPutSameIdRefused(t *testing.T) {
 	if err == nil {
 		t.Error("second Put with same id: got nil error, want refusal")
 	}
+	if errors.Is(err, memstore.ErrDuplicateOrigin) {
+		t.Errorf("second Put with same id: error = %v, want the id refusal, not ErrDuplicateOrigin", err)
+	}
 	got, err := s.Get(id)
 	if err != nil {
 		t.Fatalf("Get: %v", err)
@@ -200,9 +203,9 @@ func TestSecondPutSameIdRefused(t *testing.T) {
 	}
 }
 
-// Card section 1 / A1: a fresh store records schema_version 4 — the porter
+// Card section 1 / A1: a fresh store records schema_version 5 — the porter
 // tokenizer over the v3 format (unix-nanosecond timestamps with the provenance
-// columns) — and opens.
+// columns) plus the (origin, origin_id) unique index — and opens.
 func TestSchemaVersion(t *testing.T) {
 	s := openTemp(t)
 	db, err := sql.Open("sqlite", s.Path())
@@ -215,8 +218,8 @@ func TestSchemaVersion(t *testing.T) {
 	if err != nil {
 		t.Fatalf("SELECT schema_version: %v", err)
 	}
-	if v != 4 {
-		t.Errorf("schema_version = %d, want 4", v)
+	if v != 5 {
+		t.Errorf("schema_version = %d, want 5", v)
 	}
 }
 
@@ -225,9 +228,9 @@ func TestSchemaVersion(t *testing.T) {
 // were the current format. Each stamp gets its own fresh file so a refused
 // file never backs a later stage.
 func TestOpenRefusesUnexpectedSchemaVersion(t *testing.T) {
-	// 2 and 3 are recognized (upgraded) and 4 is current, so stamps 1 and 5 are
-	// the versions Open must refuse.
-	for _, stamp := range []int{1, 5} {
+	// 2, 3 and 4 are recognized (upgraded) and 5 is current, so stamps 1 and 6
+	// are the versions Open must refuse.
+	for _, stamp := range []int{1, 6} {
 		path := filepath.Join(t.TempDir(), "memory.db")
 		// A fresh store records the current version; stamp the row over.
 		s, err := memstore.Open(path)
@@ -383,6 +386,7 @@ func writeV3File(t *testing.T, path string) {
 	}
 	defer db.Close()
 	for _, stmt := range []string{
+		`DROP INDEX IF EXISTS idx_memory_origin_origin_id`,
 		`DROP TRIGGER IF EXISTS memory_ai`,
 		`DROP TABLE IF EXISTS record_fts`,
 		`CREATE VIRTUAL TABLE record_fts USING fts5(title, text, content = 'memory', content_rowid = 'id')`,
@@ -448,8 +452,8 @@ func TestConcurrentOpensOnV3File(t *testing.T) {
 		if rerr != nil {
 			t.Fatalf("round %d: count rows: %v", round, rerr)
 		}
-		if v != 4 {
-			t.Fatalf("round %d: schema_version = %d after concurrent open, want 4", round, v)
+		if v != 5 {
+			t.Fatalf("round %d: schema_version = %d after concurrent open, want 5", round, v)
 		}
 		if n != 1 {
 			t.Fatalf("round %d: rows = %d, want 1 (the seed row must survive the rebuild)", round, n)
@@ -1145,6 +1149,295 @@ func TestPutWritesNativeProvenance(t *testing.T) {
 	}
 }
 
+// readProvenance reads one row's provenance columns straight from the file, so
+// a test can tell NULL from the empty string.
+func readProvenance(t *testing.T, path string, id int64) (origin string, originID, ref, fsNode sql.NullString) {
+	t.Helper()
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatalf("sql.Open: %v", err)
+	}
+	defer db.Close()
+	if err := db.QueryRow(`SELECT origin, origin_id, ref, fs_node FROM memory WHERE id = ?`, id).
+		Scan(&origin, &originID, &ref, &fsNode); err != nil {
+		t.Fatalf("SELECT provenance: %v", err)
+	}
+	return origin, originID, ref, fsNode
+}
+
+// Card acceptance 1: Put writes the provenance it is handed, and Get returns it
+// byte for byte.
+func TestPutRoundTripsProvenance(t *testing.T) {
+	s := openTemp(t)
+	id, err := s.Put(&memstore.Memory{
+		Kind: "task", Text: "a task projected from fs",
+		Origin: "fs", OriginId: "evt-1", Ref: "cafebabe", FsNode: "t-42",
+	})
+	if err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+	got, err := s.Get(id)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if got.Origin != "fs" || got.OriginId != "evt-1" || got.Ref != "cafebabe" || got.FsNode != "t-42" {
+		t.Errorf("provenance = %q/%q/%q/%q, want fs/evt-1/cafebabe/t-42",
+			got.Origin, got.OriginId, got.Ref, got.FsNode)
+	}
+}
+
+// Card acceptance 3: an empty provenance field is NULL, never the empty
+// string — two Puts leaving OriginId empty must both succeed, because an empty
+// string would be an index key and the second would collide with the first.
+func TestPutEmptyProvenanceInsertsNull(t *testing.T) {
+	s := openTemp(t)
+	for i, text := range []string{"first with no origin id", "second with no origin id"} {
+		id, err := s.Put(&memstore.Memory{Kind: "note", Text: text, Origin: "fs"})
+		if err != nil {
+			t.Fatalf("Put %d: %v, want an empty OriginId stored as NULL", i+1, err)
+		}
+		origin, originID, ref, fsNode := readProvenance(t, s.Path(), id)
+		if origin != "fs" || originID.Valid || ref.Valid || fsNode.Valid {
+			t.Errorf("Put %d row provenance = %q %v %v %v, want 'fs' and three NULLs", i+1, origin, originID, ref, fsNode)
+		}
+	}
+}
+
+// Card acceptance 4: the same (origin, origin_id) twice is refused with the
+// sentinel, and the refused Put leaves no row behind.
+func TestPutRefusesDuplicateOrigin(t *testing.T) {
+	s := openTemp(t)
+	if _, err := s.Put(&memstore.Memory{Kind: "event", Text: "one event", Origin: "fs", OriginId: "evt-dup"}); err != nil {
+		t.Fatalf("first Put: %v", err)
+	}
+	_, err := s.Put(&memstore.Memory{Kind: "event", Text: "the same event again", Origin: "fs", OriginId: "evt-dup"})
+	if err == nil {
+		t.Fatal("second Put of (fs, evt-dup): got nil error, want ErrDuplicateOrigin")
+	}
+	if !errors.Is(err, memstore.ErrDuplicateOrigin) {
+		t.Errorf("second Put error = %v, want errors.Is(ErrDuplicateOrigin)", err)
+	}
+	db, err := sql.Open("sqlite", s.Path())
+	if err != nil {
+		t.Fatalf("sql.Open: %v", err)
+	}
+	defer db.Close()
+	var n int
+	if err := db.QueryRow(`SELECT count(*) FROM memory`).Scan(&n); err != nil {
+		t.Fatalf("count rows: %v", err)
+	}
+	if n != 1 {
+		t.Errorf("rows = %d after a refused duplicate, want 1", n)
+	}
+}
+
+// Card acceptance 5: the same origin_id under a different origin coexists —
+// the index is scoped by the pair, so fs's projection and Import's rows can
+// share an event id.
+func TestPutSameOriginIDDifferentOriginCoexists(t *testing.T) {
+	s := openTemp(t)
+	for _, origin := range []string{"fs", "imported"} {
+		if _, err := s.Put(&memstore.Memory{Kind: "event", Text: "shared id under " + origin, Origin: origin, OriginId: "evt-shared"}); err != nil {
+			t.Fatalf("Put(%s, evt-shared): %v", origin, err)
+		}
+	}
+	db, err := sql.Open("sqlite", s.Path())
+	if err != nil {
+		t.Fatalf("sql.Open: %v", err)
+	}
+	defer db.Close()
+	var n int
+	if err := db.QueryRow(`SELECT count(*) FROM memory WHERE origin_id = 'evt-shared'`).Scan(&n); err != nil {
+		t.Fatalf("count rows: %v", err)
+	}
+	if n != 2 {
+		t.Errorf("rows with evt-shared = %d, want 2 — the pair (origin, origin_id) is the key", n)
+	}
+}
+
+// Card acceptance 6: N callers race the same (origin, origin_id) from a shared
+// start line. Each holds its own file handle, so they contend the way separate
+// processes do. Exactly one wins; the rest are refused with the sentinel and
+// leave nothing behind.
+func TestPutDuplicateOriginBarrier(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "memory.db")
+	seed, err := memstore.Open(path)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	if err := seed.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	const n = 8
+	start := make(chan struct{})
+	errs := make([]error, n)
+	var wg sync.WaitGroup
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			s, err := memstore.Open(path)
+			if err != nil {
+				errs[i] = fmt.Errorf("open: %w", err)
+				return
+			}
+			defer s.Close()
+			<-start
+			_, errs[i] = s.Put(&memstore.Memory{
+				Kind: "event", Text: fmt.Sprintf("race loser %d", i),
+				Origin: "fs", OriginId: "evt-race",
+			})
+		}(i)
+	}
+	close(start)
+	wg.Wait()
+
+	won, dups := 0, 0
+	for i, err := range errs {
+		switch {
+		case err == nil:
+			won++
+		case errors.Is(err, memstore.ErrDuplicateOrigin):
+			dups++
+		default:
+			t.Errorf("goroutine %d: error = %v, want nil or ErrDuplicateOrigin", i, err)
+		}
+	}
+	if won != 1 || dups != n-1 {
+		t.Errorf("barrier = %d success / %d duplicate, want 1 / %d", won, dups, n-1)
+	}
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatalf("sql.Open: %v", err)
+	}
+	defer db.Close()
+	var rows int
+	if err := db.QueryRow(`SELECT count(*) FROM memory WHERE origin_id = 'evt-race'`).Scan(&rows); err != nil {
+		t.Fatalf("count rows: %v", err)
+	}
+	if rows != 1 {
+		t.Errorf("rows = %d after the race, want exactly 1", rows)
+	}
+}
+
+// Card acceptance 7: a v4 file — the pre-change schema, without the unique
+// index — upgrades in place on Open: the version reads 5, the partial unique
+// index exists, and its existing rows keep their provenance.
+func TestV4StoreUpgradesToOriginIndex(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "v4.db")
+	s, err := memstore.Open(path)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	id, err := s.Put(&memstore.Memory{
+		Kind: "task", Text: "a row born before the index",
+		Origin: "fs", OriginId: "evt-old", Ref: "cafe", FsNode: "t-9",
+	})
+	if err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatalf("sql.Open: %v", err)
+	}
+	for _, stmt := range []string{
+		`DROP INDEX IF EXISTS idx_memory_origin_origin_id`,
+		`UPDATE schema_version SET version = 4`,
+	} {
+		if _, err := db.Exec(stmt); err != nil {
+			db.Close()
+			t.Fatalf("downgrade %q: %v", stmt, err)
+		}
+	}
+	db.Close()
+
+	up, err := memstore.Open(path)
+	if err != nil {
+		t.Fatalf("Open of a v4 file: %v, want the upgrade on open", err)
+	}
+	defer up.Close()
+
+	rdb, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatalf("sql.Open: %v", err)
+	}
+	defer rdb.Close()
+	var v int
+	if err := rdb.QueryRow(`SELECT version FROM schema_version`).Scan(&v); err != nil {
+		t.Fatalf("SELECT schema_version: %v", err)
+	}
+	if v != 5 {
+		t.Errorf("schema_version = %d after upgrade, want 5", v)
+	}
+	var ddl string
+	if err := rdb.QueryRow(`SELECT sql FROM sqlite_master WHERE type = 'index' AND name = 'idx_memory_origin_origin_id'`).Scan(&ddl); err != nil {
+		t.Fatalf("SELECT the provenance index: %v", err)
+	}
+	if !strings.Contains(ddl, "UNIQUE") || !strings.Contains(ddl, "WHERE origin_id IS NOT NULL") {
+		t.Errorf("index ddl = %q, want a UNIQUE partial index limited to non-NULL origin_id", ddl)
+	}
+
+	got, err := up.Get(id)
+	if err != nil {
+		t.Fatalf("Get of a pre-upgrade row: %v", err)
+	}
+	if got.Origin != "fs" || got.OriginId != "evt-old" || got.Ref != "cafe" || got.FsNode != "t-9" {
+		t.Errorf("pre-upgrade provenance = %q/%q/%q/%q, want fs/evt-old/cafe/t-9",
+			got.Origin, got.OriginId, got.Ref, got.FsNode)
+	}
+}
+
+// Card acceptance 8: two pre-existing rows that share (origin, origin_id) make
+// the index unbuildable. Open must fail loudly, naming the index — never skip
+// it and never swallow the error.
+func TestOpenRefusesDuplicateOriginRows(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "dupes.db")
+	s, err := memstore.Open(path)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	for _, text := range []string{"one imported event", "the same imported event twice"} {
+		if _, err := s.Put(&memstore.Memory{Kind: "event", Text: text}); err != nil {
+			t.Fatalf("Put: %v", err)
+		}
+	}
+	if err := s.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatalf("sql.Open: %v", err)
+	}
+	for _, stmt := range []string{
+		`DROP INDEX IF EXISTS idx_memory_origin_origin_id`,
+		`UPDATE memory SET origin = 'imported', origin_id = 'evt-dup'`,
+		`UPDATE schema_version SET version = 4`,
+	} {
+		if _, err := db.Exec(stmt); err != nil {
+			db.Close()
+			t.Fatalf("seed %q: %v", stmt, err)
+		}
+	}
+	db.Close()
+
+	_, err = memstore.Open(path)
+	if err == nil {
+		t.Fatal("Open of a file with duplicate (origin, origin_id) rows: got nil error, want the index failure")
+	}
+	if !strings.Contains(err.Error(), "idx_memory_origin_origin_id") {
+		t.Errorf("Open error = %v, want it to name idx_memory_origin_origin_id", err)
+	}
+	if !strings.Contains(err.Error(), "UNIQUE") {
+		t.Errorf("Open error = %v, want the UNIQUE constraint failure", err)
+	}
+}
+
 // Card acceptance 5-6: a v3 file — record_fts built with the default
 // tokenizer — is upgraded on open: its rows survive, the index is rebuilt with
 // the porter stemmer, it stays external-content (no copy of the text), and the
@@ -1168,6 +1461,7 @@ func TestV3StoreUpgradesToPorter(t *testing.T) {
 		t.Fatalf("sql.Open: %v", err)
 	}
 	for _, stmt := range []string{
+		`DROP INDEX IF EXISTS idx_memory_origin_origin_id`,
 		`DROP TRIGGER IF EXISTS memory_ai`,
 		`DROP TABLE IF EXISTS record_fts`,
 		`CREATE VIRTUAL TABLE record_fts USING fts5(title, text, content = 'memory', content_rowid = 'id')`,
@@ -1205,8 +1499,8 @@ func TestV3StoreUpgradesToPorter(t *testing.T) {
 	if err := rdb.QueryRow(`SELECT version FROM schema_version`).Scan(&v); err != nil {
 		t.Fatalf("SELECT schema_version: %v", err)
 	}
-	if v != 4 {
-		t.Errorf("schema_version = %d after upgrade, want 4", v)
+	if v != 5 {
+		t.Errorf("schema_version = %d after upgrade, want 5", v)
 	}
 	var shadow int
 	if err := rdb.QueryRow(`SELECT count(*) FROM sqlite_master WHERE name = 'record_fts_content'`).Scan(&shadow); err != nil {
@@ -1257,6 +1551,7 @@ func TestV2StoreOpensAndUpgrades(t *testing.T) {
 		t.Fatalf("sql.Open: %v", err)
 	}
 	for _, stmt := range []string{
+		`DROP INDEX IF EXISTS idx_memory_origin_origin_id`,
 		`DROP INDEX IF EXISTS idx_memory_fs_node`,
 		`ALTER TABLE memory DROP COLUMN origin`,
 		`ALTER TABLE memory DROP COLUMN origin_id`,
@@ -1286,8 +1581,8 @@ func TestV2StoreOpensAndUpgrades(t *testing.T) {
 	if err := rdb.QueryRow(`SELECT version FROM schema_version`).Scan(&v); err != nil {
 		t.Fatalf("SELECT schema_version: %v", err)
 	}
-	if v != 4 {
-		t.Errorf("schema_version = %d after upgrade, want 4", v)
+	if v != 5 {
+		t.Errorf("schema_version = %d after upgrade, want 5", v)
 	}
 	var cols int
 	if err := rdb.QueryRow(`SELECT count(*) FROM pragma_table_info('memory') WHERE name IN ('origin', 'origin_id', 'ref', 'fs_node')`).Scan(&cols); err != nil {
@@ -1957,8 +2252,8 @@ func TestImportEmbedsWhenConfigured(t *testing.T) {
 	if err := db.QueryRow(`SELECT version FROM schema_version`).Scan(&v); err != nil {
 		t.Fatalf("schema_version: %v", err)
 	}
-	if v != 4 {
-		t.Errorf("schema_version = %d with vectors on, want 4 (vectors are an enablement, not a format)", v)
+	if v != 5 {
+		t.Errorf("schema_version = %d with vectors on, want 5 (vectors are an enablement, not a format)", v)
 	}
 
 	plain := openTemp(t)

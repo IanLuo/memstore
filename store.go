@@ -46,8 +46,9 @@ type Memory struct {
 	FoundBy    string
 	Hash       string
 
-	// Provenance — where this row came from. A native row is 'native' with
-	// the rest empty; Import is the only writer of any other shape.
+	// Provenance — where this row came from. Put writes what the caller
+	// supplies, defaulting an empty Origin to 'native'; Import fills the
+	// imported shape. An empty OriginId, Ref or FsNode is stored as NULL.
 	Origin   string
 	OriginId string
 	Ref      string
@@ -77,15 +78,17 @@ type Store struct {
 	dim      int
 }
 
-// schemaVersion is the schema_version row's current value: 4, the porter
+// schemaVersion is the schema_version row's current value: 5, the porter
 // tokenizer on the FTS index over the v3 format (unix-nanosecond timestamps
-// plus the slice-3 provenance columns). Version 3 (default tokenizer) and
-// version 2 (no provenance) are upgraded on Open, both through the same path
-// that rebuilds record_fts; version 1 (unix seconds, written by the first
-// slice release, 5aa287a) is refused, never misread; a file stamped with
-// anything else is refused on Open, never silently migrated or misread. Keep
-// the INSERT literal in schema equal to this; TestSchemaVersion pins both.
-const schemaVersion = 4
+// plus the slice-3 provenance columns) with the (origin, origin_id) unique
+// index over those columns. Version 4 (same format, no unique index), version 3
+// (default tokenizer) and version 2 (no provenance) are upgraded on Open,
+// through the same path that creates the index and rebuilds record_fts;
+// version 1 (unix seconds, written by the first slice release, 5aa287a) is
+// refused, never misread; a file stamped with anything else is refused on
+// Open, never silently migrated or misread. Keep the INSERT literal in schema
+// equal to this; TestSchemaVersion pins both.
+const schemaVersion = 5
 
 // busyTimeout is how long a statement waits for the file's write lock before
 // it fails. It is named once because two places set the same bound — the
@@ -146,7 +149,7 @@ END;
 
 CREATE TABLE IF NOT EXISTS schema_version (version INTEGER NOT NULL);
 INSERT INTO schema_version(version)
-	SELECT 4 WHERE NOT EXISTS (SELECT 1 FROM schema_version);
+	SELECT 5 WHERE NOT EXISTS (SELECT 1 FROM schema_version);
 `
 
 // vecSchema is record_vec, the optional projection behind the vector matcher.
@@ -195,7 +198,7 @@ func Open(path string) (*Store, error) {
 	}
 	// Refuse a file stamped with a schema_version we do not expect before
 	// anything touches it — no WAL, no schema write, no chmod. The recognized
-	// versions are 2 and 3 (previous formats, upgraded below) and the current
+	// versions are 2, 3 and 4 (previous formats, upgraded below) and the current
 	// one; a version-1 file stores ts in seconds, not nanoseconds, and reading
 	// it as current would silently show 1970.
 	v := 0
@@ -209,7 +212,7 @@ func Open(path string) (*Store, error) {
 			db.Close()
 			return nil, fmt.Errorf("memstore: read schema_version from %s: %w", path, err)
 		}
-		if v != 2 && v != 3 && v != schemaVersion {
+		if v != 2 && v != 3 && v != 4 && v != schemaVersion {
 			db.Close()
 			return nil, fmt.Errorf("memstore: open %s: schema_version is %d, want %d (porter-tokenized FTS index)", path, v, schemaVersion)
 		}
@@ -281,7 +284,7 @@ func Open(path string) (*Store, error) {
 			// a fresh file gets them from the schema just applied. The upgrade
 			// is additive, guarded step by step by what already exists: the
 			// missing columns are added with their v3 definition, the fs_node
-			// index is created, and the version row moves to 4. Existing rows
+			// index is created, and the version row moves to 5. Existing rows
 			// are untouched — their origin picks up the column's default
 			// 'native'.
 			for _, add := range []struct{ col, ddl string }{
@@ -308,6 +311,18 @@ func Open(path string) (*Store, error) {
 				tx.Rollback()
 				db.Close()
 				return nil, fmt.Errorf("memstore: upgrade %s: %w", path, err)
+			}
+			// The partial unique index is what makes a re-put idempotent: a
+			// duplicate (origin, origin_id) is refused at the INSERT, and two
+			// rows cannot coexist under a race. It is partial because empty
+			// provenance is stored as NULL, and NULL never collides. The index
+			// is built over the rows a file already carries, so a file holding
+			// pre-existing duplicates fails this open loudly, naming the index;
+			// skipping it would leave that file without the guarantee.
+			if _, err := tx.Exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_memory_origin_origin_id ON memory(origin, origin_id) WHERE origin_id IS NOT NULL`); err != nil {
+				tx.Rollback()
+				db.Close()
+				return nil, fmt.Errorf("memstore: upgrade %s: create unique index idx_memory_origin_origin_id: %w", path, err)
 			}
 			// A file stamped 2 or 3 carries record_fts built with the default
 			// tokenizer, and FTS5 bakes the tokenizer into the table at CREATE.
@@ -338,7 +353,7 @@ func Open(path string) (*Store, error) {
 					}
 				}
 			}
-			if _, err := tx.Exec(`UPDATE schema_version SET version = ? WHERE version IN (2, 3)`, schemaVersion); err != nil {
+			if _, err := tx.Exec(`UPDATE schema_version SET version = ? WHERE version IN (2, 3, 4)`, schemaVersion); err != nil {
 				tx.Rollback()
 				db.Close()
 				return nil, fmt.Errorf("memstore: upgrade %s: %w", path, err)
@@ -415,12 +430,21 @@ func (s *Store) readRows(query string, args ...any) (*sql.Rows, error) {
 	return s.db.Query(query, args...)
 }
 
+// ErrDuplicateOrigin is returned by Put when another memory already carries
+// the same (origin, origin_id) pair; errors.Is matches it. The check is the
+// partial unique index, so it holds under a race as well as in sequence. A pair
+// whose origin_id is empty is never compared: empty provenance is stored as
+// NULL, and the index skips NULL.
+var ErrDuplicateOrigin = errors.New("memstore: put: (origin, origin_id) already exists")
+
 // Put appends one memory and returns its id. Text and kind are required; an
 // explicit nonzero id is honoured only if it is free. Content is never
 // updated, so a second Put of an existing id is refused. A caller-supplied
-// DeletedAt is refused: deletion is forget's job, the one writer of that
-// state — and provenance is import's, so a Put always writes origin 'native'
-// with the rest empty, whatever the caller's struct carried.
+// DeletedAt is refused: deletion is forget's job. Provenance is content: the
+// four fields are written from the struct, an empty Origin becomes 'native',
+// and an empty OriginId, Ref or FsNode is stored as NULL. A row that already
+// carries the same (origin, origin_id) is refused with ErrDuplicateOrigin, so
+// a caller projecting an event log decides whether a re-run is a skip.
 func (s *Store) Put(m *Memory) (int64, error) {
 	if m.Text == "" {
 		return 0, errors.New("memstore: put: text is empty")
@@ -442,6 +466,10 @@ func (s *Store) Put(m *Memory) (int64, error) {
 	if status == "" {
 		status = "open"
 	}
+	origin := m.Origin
+	if origin == "" {
+		origin = "native"
+	}
 	sum := sha256.Sum256([]byte(m.Text))
 
 	tx, err := s.db.Begin()
@@ -458,8 +486,11 @@ func (s *Store) Put(m *Memory) (int64, error) {
 		nullableId(m.Id), ts.UnixNano(), m.Kind, m.Scope, m.Title, m.Text, m.Extra,
 		m.Importance, m.Tier, status, nil, m.Parent,
 		m.Supersedes, m.FoundBy, hex.EncodeToString(sum[:]),
-		"native", nil, nil, nil)
+		origin, nullableText(m.OriginId), nullableText(m.Ref), nullableText(m.FsNode))
 	if err != nil {
+		if isDuplicateOrigin(err) {
+			return 0, fmt.Errorf("memstore: put: %w", ErrDuplicateOrigin)
+		}
 		return 0, fmt.Errorf("memstore: put: %w", err)
 	}
 	id, err := res.LastInsertId()
@@ -481,6 +512,17 @@ func (s *Store) Put(m *Memory) (int64, error) {
 		return 0, fmt.Errorf("memstore: put: %w", err)
 	}
 	return id, nil
+}
+
+// isDuplicateOrigin reports whether err is the provenance index's refusal of a
+// duplicate (origin, origin_id). The constraint's message names the columns,
+// which is what separates it from the primary-key refusal of an explicit id.
+func isDuplicateOrigin(err error) bool {
+	var se *sqlite.Error
+	if !errors.As(err, &se) || (se.Code()&0xff) != sqlite3.SQLITE_CONSTRAINT {
+		return false
+	}
+	return strings.Contains(se.Error(), "memory.origin, memory.origin_id")
 }
 
 // Get returns one memory by id. A missing id is an error, never a zero memory.
@@ -1078,4 +1120,15 @@ func nullableId(id int64) any {
 		return nil
 	}
 	return id
+}
+
+// nullableText maps the empty string to NULL for a provenance column. Empty
+// string is a value the unique index would compare, so two rows leaving
+// origin_id empty would share the key ('native', empty); NULL is what the index
+// skips.
+func nullableText(s string) any {
+	if s == "" {
+		return nil
+	}
+	return s
 }
