@@ -403,7 +403,7 @@ func writeV3File(t *testing.T, path string) {
 // Card acceptance 1: openers that start *together* on a genuine v3 file. The
 // upgrade after the schema is one transaction and re-reads schema_version under
 // its write lock, so a second opener that read v3 before the winner committed
-// finds version 4 and does nothing. Before that fix the loser replayed the
+// finds version 5 and does nothing. Before that fix the loser replayed the
 // rebuild outside any transaction and died on its own CREATE TRIGGER memory_ai
 // already exists — a failure a staggered test never sees.
 func TestConcurrentOpensOnV3File(t *testing.T) {
@@ -1216,6 +1216,9 @@ func TestPutRefusesDuplicateOrigin(t *testing.T) {
 	}
 	if !errors.Is(err, memstore.ErrDuplicateOrigin) {
 		t.Errorf("second Put error = %v, want errors.Is(ErrDuplicateOrigin)", err)
+	}
+	if n := strings.Count(err.Error(), "memstore: put:"); n != 1 {
+		t.Errorf("second Put error = %q, want one 'memstore: put:' prefix", err)
 	}
 	db, err := sql.Open("sqlite", s.Path())
 	if err != nil {

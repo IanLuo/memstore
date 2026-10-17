@@ -83,7 +83,8 @@ type Store struct {
 // plus the slice-3 provenance columns) with the (origin, origin_id) unique
 // index over those columns. Version 4 (same format, no unique index), version 3
 // (default tokenizer) and version 2 (no provenance) are upgraded on Open,
-// through the same path that creates the index and rebuilds record_fts;
+// through the same path that creates the index and, for a v2 or v3 file,
+// rebuilds record_fts;
 // version 1 (unix seconds, written by the first slice release, 5aa287a) is
 // refused, never misread; a file stamped with anything else is refused on
 // Open, never silently migrated or misread. Keep the INSERT literal in schema
@@ -431,11 +432,12 @@ func (s *Store) readRows(query string, args ...any) (*sql.Rows, error) {
 }
 
 // ErrDuplicateOrigin is returned by Put when another memory already carries
-// the same (origin, origin_id) pair; errors.Is matches it. The check is the
-// partial unique index, so it holds under a race as well as in sequence. A pair
-// whose origin_id is empty is never compared: empty provenance is stored as
-// NULL, and the index skips NULL.
-var ErrDuplicateOrigin = errors.New("memstore: put: (origin, origin_id) already exists")
+// the same (origin, origin_id) pair; errors.Is matches it. Put checks the pair
+// inside its own transaction, under the write lock BEGIN IMMEDIATE takes, so a
+// concurrent writer cannot slip between the read and the INSERT; the partial
+// unique index is the backstop. A pair whose origin_id is empty is never
+// compared: empty provenance is stored as NULL, and the index skips NULL.
+var ErrDuplicateOrigin = errors.New("(origin, origin_id) already exists")
 
 // Put appends one memory and returns its id. Text and kind are required; an
 // explicit nonzero id is honoured only if it is free. Content is never
@@ -477,6 +479,20 @@ func (s *Store) Put(m *Memory) (int64, error) {
 		return 0, fmt.Errorf("memstore: put: %w", err)
 	}
 	defer tx.Rollback()
+	// BEGIN IMMEDIATE holds the write lock from here, so this read and the
+	// INSERT it guards cannot be interleaved with another writer's. The unique
+	// index still enforces the pair; this check is what turns the refusal into
+	// the sentinel, without reading the driver's error text back for its
+	// meaning. Empty origin_id is skipped: it is stored as NULL, never compared.
+	if m.OriginId != "" {
+		var dup int
+		if err := tx.QueryRow(`SELECT EXISTS (SELECT 1 FROM memory WHERE origin = ? AND origin_id = ?)`, origin, m.OriginId).Scan(&dup); err != nil {
+			return 0, fmt.Errorf("memstore: put: %w", err)
+		}
+		if dup == 1 {
+			return 0, fmt.Errorf("memstore: put: %w", ErrDuplicateOrigin)
+		}
+	}
 	res, err := tx.Exec(`
 		INSERT INTO memory
 			(id, ts, kind, scope, title, text, extra, importance, tier, status,
@@ -488,9 +504,6 @@ func (s *Store) Put(m *Memory) (int64, error) {
 		m.Supersedes, m.FoundBy, hex.EncodeToString(sum[:]),
 		origin, nullableText(m.OriginId), nullableText(m.Ref), nullableText(m.FsNode))
 	if err != nil {
-		if isDuplicateOrigin(err) {
-			return 0, fmt.Errorf("memstore: put: %w", ErrDuplicateOrigin)
-		}
 		return 0, fmt.Errorf("memstore: put: %w", err)
 	}
 	id, err := res.LastInsertId()
@@ -512,17 +525,6 @@ func (s *Store) Put(m *Memory) (int64, error) {
 		return 0, fmt.Errorf("memstore: put: %w", err)
 	}
 	return id, nil
-}
-
-// isDuplicateOrigin reports whether err is the provenance index's refusal of a
-// duplicate (origin, origin_id). The constraint's message names the columns,
-// which is what separates it from the primary-key refusal of an explicit id.
-func isDuplicateOrigin(err error) bool {
-	var se *sqlite.Error
-	if !errors.As(err, &se) || (se.Code()&0xff) != sqlite3.SQLITE_CONSTRAINT {
-		return false
-	}
-	return strings.Contains(se.Error(), "memory.origin, memory.origin_id")
 }
 
 // Get returns one memory by id. A missing id is an error, never a zero memory.
