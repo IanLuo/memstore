@@ -203,9 +203,10 @@ func TestSecondPutSameIdRefused(t *testing.T) {
 	}
 }
 
-// Card section 1 / A1: a fresh store records schema_version 5 — the porter
+// Card section 1 / A1: a fresh store records schema_version 6 — the porter
 // tokenizer over the v3 format (unix-nanosecond timestamps with the provenance
-// columns) plus the (origin, origin_id) unique index — and opens.
+// columns), the (origin, origin_id) unique index, and the scope index — and
+// opens.
 func TestSchemaVersion(t *testing.T) {
 	s := openTemp(t)
 	db, err := sql.Open("sqlite", s.Path())
@@ -218,8 +219,8 @@ func TestSchemaVersion(t *testing.T) {
 	if err != nil {
 		t.Fatalf("SELECT schema_version: %v", err)
 	}
-	if v != 5 {
-		t.Errorf("schema_version = %d, want 5", v)
+	if v != 6 {
+		t.Errorf("schema_version = %d, want 6", v)
 	}
 }
 
@@ -228,9 +229,9 @@ func TestSchemaVersion(t *testing.T) {
 // were the current format. Each stamp gets its own fresh file so a refused
 // file never backs a later stage.
 func TestOpenRefusesUnexpectedSchemaVersion(t *testing.T) {
-	// 2, 3 and 4 are recognized (upgraded) and 5 is current, so stamps 1 and 6
+	// 2, 3, 4 and 5 are recognized (upgraded) and 6 is current, so stamps 1 and 7
 	// are the versions Open must refuse.
-	for _, stamp := range []int{1, 6} {
+	for _, stamp := range []int{1, 7} {
 		path := filepath.Join(t.TempDir(), "memory.db")
 		// A fresh store records the current version; stamp the row over.
 		s, err := memstore.Open(path)
@@ -403,7 +404,7 @@ func writeV3File(t *testing.T, path string) {
 // Card acceptance 1: openers that start *together* on a genuine v3 file. The
 // upgrade after the schema is one transaction and re-reads schema_version under
 // its write lock, so a second opener that read v3 before the winner committed
-// finds version 5 and does nothing. Before that fix the loser replayed the
+// finds version 6 and does nothing. Before that fix the loser replayed the
 // rebuild outside any transaction and died on its own CREATE TRIGGER memory_ai
 // already exists — a failure a staggered test never sees.
 func TestConcurrentOpensOnV3File(t *testing.T) {
@@ -452,8 +453,8 @@ func TestConcurrentOpensOnV3File(t *testing.T) {
 		if rerr != nil {
 			t.Fatalf("round %d: count rows: %v", round, rerr)
 		}
-		if v != 5 {
-			t.Fatalf("round %d: schema_version = %d after concurrent open, want 5", round, v)
+		if v != 6 {
+			t.Fatalf("round %d: schema_version = %d after concurrent open, want 6", round, v)
 		}
 		if n != 1 {
 			t.Fatalf("round %d: rows = %d, want 1 (the seed row must survive the rebuild)", round, n)
@@ -1374,8 +1375,8 @@ func TestV4StoreUpgradesToOriginIndex(t *testing.T) {
 	if err := rdb.QueryRow(`SELECT version FROM schema_version`).Scan(&v); err != nil {
 		t.Fatalf("SELECT schema_version: %v", err)
 	}
-	if v != 5 {
-		t.Errorf("schema_version = %d after upgrade, want 5", v)
+	if v != 6 {
+		t.Errorf("schema_version = %d after upgrade, want 6", v)
 	}
 	var ddl string
 	if err := rdb.QueryRow(`SELECT sql FROM sqlite_master WHERE type = 'index' AND name = 'idx_memory_origin_origin_id'`).Scan(&ddl); err != nil {
@@ -1441,6 +1442,173 @@ func TestOpenRefusesDuplicateOriginRows(t *testing.T) {
 	}
 }
 
+// Card acceptance: a v5 file — the pre-change schema, without the scope index —
+// gains the index on Open, reports 6, and keeps its rows. A v5 file is the shape
+// every existing store has, so this is the upgrade the live store takes.
+func TestV5StoreUpgradesToScopeIndex(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "v5.db")
+	s, err := memstore.Open(path)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	id, err := s.Put(&memstore.Memory{Kind: "task", Scope: "fs:cap", Text: "a row born before the scope index"})
+	if err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatalf("sql.Open: %v", err)
+	}
+	for _, stmt := range []string{
+		`DROP INDEX IF EXISTS idx_memory_scope_recent`,
+		`UPDATE schema_version SET version = 5`,
+	} {
+		if _, err := db.Exec(stmt); err != nil {
+			db.Close()
+			t.Fatalf("downgrade %q: %v", stmt, err)
+		}
+	}
+	db.Close()
+
+	up, err := memstore.Open(path)
+	if err != nil {
+		t.Fatalf("Open of a v5 file: %v, want the upgrade on open", err)
+	}
+	defer up.Close()
+
+	rdb, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatalf("sql.Open: %v", err)
+	}
+	defer rdb.Close()
+	var v int
+	if err := rdb.QueryRow(`SELECT version FROM schema_version`).Scan(&v); err != nil {
+		t.Fatalf("SELECT schema_version: %v", err)
+	}
+	if v != 6 {
+		t.Errorf("schema_version = %d after upgrade, want 6", v)
+	}
+	var ddl string
+	if err := rdb.QueryRow(`SELECT sql FROM sqlite_master WHERE type = 'index' AND name = 'idx_memory_scope_recent'`).Scan(&ddl); err != nil {
+		t.Fatalf("SELECT the scope index: %v", err)
+	}
+	for _, want := range []string{"scope", "deleted_at", "ts DESC", "id DESC"} {
+		if !strings.Contains(ddl, want) {
+			t.Errorf("index ddl = %q, want it to carry %q", ddl, want)
+		}
+	}
+
+	got, err := up.Get(id)
+	if err != nil {
+		t.Fatalf("Get of a pre-upgrade row: %v", err)
+	}
+	if got.Scope != "fs:cap" || got.Text != "a row born before the scope index" {
+		t.Errorf("pre-upgrade row = scope %q text %q, want fs:cap / a row born before the scope index", got.Scope, got.Text)
+	}
+}
+
+// Card acceptance: a file that cannot take the scope index fails Open loudly,
+// naming it — never skipping the index. Index creation cannot fail on data (it
+// is not UNIQUE), so the reachable collision is an object already carrying the
+// index's name; a table of that name reproduces it.
+func TestOpenRefusesScopeIndexCollision(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "clash.db")
+	s, err := memstore.Open(path)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	if _, err := s.Put(&memstore.Memory{Kind: "note", Text: "one row"}); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatalf("sql.Open: %v", err)
+	}
+	for _, stmt := range []string{
+		`DROP INDEX IF EXISTS idx_memory_scope_recent`,
+		`CREATE TABLE idx_memory_scope_recent (x)`,
+		`UPDATE schema_version SET version = 5`,
+	} {
+		if _, err := db.Exec(stmt); err != nil {
+			db.Close()
+			t.Fatalf("seed %q: %v", stmt, err)
+		}
+	}
+	db.Close()
+
+	_, err = memstore.Open(path)
+	if err == nil {
+		t.Fatal("Open of a file that cannot take the scope index: got nil error, want the index failure")
+	}
+	if !strings.Contains(err.Error(), "idx_memory_scope_recent") {
+		t.Errorf("Open error = %v, want it to name idx_memory_scope_recent", err)
+	}
+}
+
+// Card acceptance: the read's cost is the evidence, not the index's existence.
+// Recent's scope listing must be a SEARCH on idx_memory_scope_recent with no
+// temp b-tree for the ORDER BY; an index that exists but is not chosen fails
+// here. The query is the one Recent issues, column list included.
+func TestRecentScopeListingUsesIndex(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "memory.db")
+	s, err := memstore.Open(path)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	for i := 0; i < 5; i++ {
+		if _, err := s.Put(&memstore.Memory{Kind: "note", Scope: "fs:cap", Text: fmt.Sprintf("row %d", i)}); err != nil {
+			t.Fatalf("Put: %v", err)
+		}
+	}
+	if err := s.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatalf("sql.Open: %v", err)
+	}
+	defer db.Close()
+
+	query := `SELECT memory.id, memory.ts, memory.kind, memory.scope, memory.title,
+		memory.text, memory.extra, memory.importance, memory.tier, memory.status,
+		memory.deleted_at, memory.parent, memory.supersedes, memory.found_by, memory.hash,
+		memory.origin, memory.origin_id, memory.ref, memory.fs_node
+		FROM memory WHERE deleted_at IS NULL AND scope = ? ORDER BY ts DESC, id DESC LIMIT ?`
+	rows, err := db.Query(`EXPLAIN QUERY PLAN `+query, "fs:cap", 10)
+	if err != nil {
+		t.Fatalf("EXPLAIN QUERY PLAN: %v", err)
+	}
+	defer rows.Close()
+	var plan []string
+	for rows.Next() {
+		var id, parent, notused int
+		var detail string
+		if err := rows.Scan(&id, &parent, &notused, &detail); err != nil {
+			t.Fatalf("scan plan row: %v", err)
+		}
+		plan = append(plan, detail)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("plan rows: %v", err)
+	}
+	got := strings.Join(plan, " | ")
+	if !strings.Contains(got, "idx_memory_scope_recent") || !strings.Contains(got, "SEARCH") {
+		t.Errorf("plan = %q, want a SEARCH on idx_memory_scope_recent", got)
+	}
+	if strings.Contains(got, "TEMP B-TREE") {
+		t.Errorf("plan = %q, want no temp b-tree for the ORDER BY", got)
+	}
+}
+
 // Card acceptance 5-6: a v3 file — record_fts built with the default
 // tokenizer — is upgraded on open: its rows survive, the index is rebuilt with
 // the porter stemmer, it stays external-content (no copy of the text), and the
@@ -1502,8 +1670,8 @@ func TestV3StoreUpgradesToPorter(t *testing.T) {
 	if err := rdb.QueryRow(`SELECT version FROM schema_version`).Scan(&v); err != nil {
 		t.Fatalf("SELECT schema_version: %v", err)
 	}
-	if v != 5 {
-		t.Errorf("schema_version = %d after upgrade, want 5", v)
+	if v != 6 {
+		t.Errorf("schema_version = %d after upgrade, want 6", v)
 	}
 	var shadow int
 	if err := rdb.QueryRow(`SELECT count(*) FROM sqlite_master WHERE name = 'record_fts_content'`).Scan(&shadow); err != nil {
@@ -1584,8 +1752,8 @@ func TestV2StoreOpensAndUpgrades(t *testing.T) {
 	if err := rdb.QueryRow(`SELECT version FROM schema_version`).Scan(&v); err != nil {
 		t.Fatalf("SELECT schema_version: %v", err)
 	}
-	if v != 5 {
-		t.Errorf("schema_version = %d after upgrade, want 5", v)
+	if v != 6 {
+		t.Errorf("schema_version = %d after upgrade, want 6", v)
 	}
 	var cols int
 	if err := rdb.QueryRow(`SELECT count(*) FROM pragma_table_info('memory') WHERE name IN ('origin', 'origin_id', 'ref', 'fs_node')`).Scan(&cols); err != nil {
@@ -2255,8 +2423,8 @@ func TestImportEmbedsWhenConfigured(t *testing.T) {
 	if err := db.QueryRow(`SELECT version FROM schema_version`).Scan(&v); err != nil {
 		t.Fatalf("schema_version: %v", err)
 	}
-	if v != 5 {
-		t.Errorf("schema_version = %d with vectors on, want 5 (vectors are an enablement, not a format)", v)
+	if v != 6 {
+		t.Errorf("schema_version = %d with vectors on, want 6 (vectors are an enablement, not a format)", v)
 	}
 
 	plain := openTemp(t)

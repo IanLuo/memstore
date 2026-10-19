@@ -14,6 +14,11 @@
 // throwaway memstore, and reports the mapping numbers, the events-vs-nodes
 // shape, and a small set of recall probes — each also run through the fs
 // binary's own `query`, when -fsbin is given, for comparison.
+//
+// Part C copies a real memstore file (never the original) and times its
+// scope-listing read, Store.Recent(scope, k), with the spread and the
+// EXPLAIN QUERY PLAN beside it — the read cost this store's scope index exists
+// to hold down.
 package main
 
 import (
@@ -136,6 +141,13 @@ type config struct {
 	src      string
 	fsbin    string
 	part     string
+
+	// Part C — the scope-listing read.
+	memsrc string
+	scopeK int
+	runs   int
+	warmup int
+	scopes int
 }
 
 func main() {
@@ -148,11 +160,17 @@ func main() {
 		work     = flag.String("work", "", "working directory (default: a fresh temp dir)")
 		src      = flag.String("src", "~/.fs/store.db", "fs-style source store for part B (copied, never opened in place)")
 		fsbin    = flag.String("fsbin", "", "fs binary; when set, part B also runs `fs query` for each probe")
-		part     = flag.String("part", "all", "a, b, or all")
+		part     = flag.String("part", "all", "a, b, c, or all")
+		memsrc   = flag.String("memsrc", "~/.memstore/memory.db", "memstore file for part C (copied, never opened in place)")
+		scopeK   = flag.Int("scopek", 1<<20, "k a scope listing asks for in part C (fs's recentLimit)")
+		runs     = flag.Int("runs", 30, "timed runs per scope in part C")
+		warmup   = flag.Int("warmup", 5, "untimed warm-up calls per scope in part C")
+		scopes   = flag.Int("scopes", 5, "scopes measured in part C, by row count")
 	)
 	flag.Parse()
 
-	cfg := config{queries: *queries, k: *k, passes: *passes, openReps: *openReps, part: *part, src: expandHome(*src), fsbin: *fsbin}
+	cfg := config{queries: *queries, k: *k, passes: *passes, openReps: *openReps, part: *part, src: expandHome(*src), fsbin: *fsbin,
+		memsrc: expandHome(*memsrc), scopeK: *scopeK, runs: *runs, warmup: *warmup, scopes: *scopes}
 	for _, s := range strings.Split(*nFlag, ",") {
 		s = strings.TrimSpace(s)
 		if s == "" {
@@ -185,6 +203,11 @@ func main() {
 	if cfg.part == "b" || cfg.part == "all" {
 		if err := partB(cfg); err != nil {
 			fatal("part B: %v", err)
+		}
+	}
+	if cfg.part == "c" || cfg.part == "all" {
+		if err := partC(cfg); err != nil {
+			fatal("part C: %v", err)
 		}
 	}
 }
@@ -527,6 +550,158 @@ func partB(cfg config) error {
 	}
 	fmt.Println()
 	fmt.Printf("events-vs-nodes observation: this import is one memory row per fs EVENT, so the store holds %d rows for %d distinct nodes (%.2f rows/node).\n", srcEvents, srcNodes, perNode.mean)
+	fmt.Println()
+	return nil
+}
+
+// benchMemoryCols is the column list Recent reads, in scan order. Part C asks
+// the plan for the query Recent issues, so the projection must match.
+const benchMemoryCols = `memory.id, memory.ts, memory.kind, memory.scope, memory.title,
+	memory.text, memory.extra, memory.importance, memory.tier, memory.status,
+	memory.deleted_at, memory.parent, memory.supersedes, memory.found_by, memory.hash,
+	memory.origin, memory.origin_id, memory.ref, memory.fs_node`
+
+// queryPlan renders one EXPLAIN QUERY PLAN for a query as a single line, so the
+// plan SQLite chose can be pasted as evidence.
+func queryPlan(db *sql.DB, query string, args ...any) (string, error) {
+	rows, err := db.Query(`EXPLAIN QUERY PLAN `+query, args...)
+	if err != nil {
+		return "", err
+	}
+	defer rows.Close()
+	var parts []string
+	for rows.Next() {
+		var id, parent, notused int
+		var detail string
+		if err := rows.Scan(&id, &parent, &notused, &detail); err != nil {
+			return "", err
+		}
+		parts = append(parts, detail)
+	}
+	if err := rows.Err(); err != nil {
+		return "", err
+	}
+	return strings.Join(parts, " | "), nil
+}
+
+// printSpread reports a timing sample with its spread: min, p50, p95 and max.
+// The median alone is not evidence on a machine running other agents, so the
+// tails are printed beside it.
+func printSpread(label string, rows int, xs []float64) {
+	fmt.Printf("%-46s rows %5d  min %8.3f  p50 %8.3f  p95 %8.3f  max %8.3f ms\n",
+		label, rows, pctl(xs, 0), pctl(xs, 50), pctl(xs, 95), pctl(xs, 100))
+}
+
+// partC measures the scope-listing read — Store.Recent(scope, k) — on a copy of
+// a real store, with the plan SQLite answers it with. This is the number this
+// round turns on: the acceptance is the READ's cost, not the index's existence,
+// and a speedup without its spread is not evidence. It copies the source (db
+// plus sidecars) and never opens the original in place, the rule part B keeps.
+//
+// The before/after pair is not two code paths here: run this part against a
+// store the previous revision wrote (schema_version 5) and again against the
+// same store once Open has carried it to the current version, one protocol each.
+func partC(cfg config) error {
+	fmt.Printf("=== Part C: scope-listing read cost (Recent) ===\n")
+	srcStat, err := os.Stat(cfg.memsrc)
+	if err != nil {
+		return fmt.Errorf("memstore source %s: %w", cfg.memsrc, err)
+	}
+	copyPath := filepath.Join(cfg.work, "scope-copy.db")
+	for _, suf := range []string{"", "-wal", "-shm"} {
+		if _, serr := os.Stat(cfg.memsrc + suf); serr != nil {
+			continue
+		}
+		if err := copyFile(copyPath+suf, cfg.memsrc+suf); err != nil {
+			return err
+		}
+	}
+	fmt.Printf("source     : %s (%d B) -- copied to %s; the original is never opened in place\n", cfg.memsrc, srcStat.Size(), copyPath)
+
+	s, err := memstore.Open(copyPath)
+	if err != nil {
+		return err
+	}
+	defer s.Close()
+
+	db, err := sql.Open("sqlite", copyPath)
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+	db.SetMaxOpenConns(1)
+
+	var v, total, live int
+	if err := db.QueryRow(`SELECT version FROM schema_version`).Scan(&v); err != nil {
+		return err
+	}
+	if err := db.QueryRow(`SELECT count(*), coalesce(sum(deleted_at IS NULL), 0) FROM memory`).Scan(&total, &live); err != nil {
+		return err
+	}
+	var idx string
+	if err := db.QueryRow(`SELECT coalesce((SELECT sql FROM sqlite_master WHERE type = 'index' AND name = 'idx_memory_scope_recent'), '(absent)')`).Scan(&idx); err != nil {
+		return err
+	}
+	fmt.Printf("store shape: schema_version %d, %d rows, %d live; scope index: %s\n", v, total, live, idx)
+	fmt.Printf("protocol   : %d warm-up calls discarded, then %d timed calls per scope, one process and one connection; min/p50/p95/max ms; k=%d (fs's recentLimit)\n", cfg.warmup, cfg.runs, cfg.scopeK)
+
+	// The scopes the store actually holds, biggest first. A scope listing is for
+	// one of them, so these are the reads worth timing. The empty scope is
+	// skipped: Recent("") is the whole store, not a scope listing, and its row
+	// count would make the label lie.
+	srows, err := db.Query(`SELECT scope, count(*) FROM memory WHERE deleted_at IS NULL AND scope <> '' GROUP BY scope ORDER BY count(*) DESC, scope LIMIT ?`, cfg.scopes)
+	if err != nil {
+		return err
+	}
+	type scopeCount struct {
+		scope string
+		n     int
+	}
+	var list []scopeCount
+	for srows.Next() {
+		var sc scopeCount
+		if err := srows.Scan(&sc.scope, &sc.n); err != nil {
+			srows.Close()
+			return err
+		}
+		list = append(list, sc)
+	}
+	srows.Close()
+	if err := srows.Err(); err != nil {
+		return err
+	}
+	if len(list) == 0 {
+		fmt.Println("plan       : (no live rows; nothing to list)")
+		fmt.Println()
+		return nil
+	}
+
+	plan, err := queryPlan(db, `SELECT `+benchMemoryCols+` FROM memory WHERE deleted_at IS NULL AND scope = ? ORDER BY ts DESC, id DESC LIMIT ?`, list[0].scope, cfg.scopeK)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("plan       : Recent(%q, k): %s\n", list[0].scope, plan)
+
+	for _, sc := range list {
+		call := func() error {
+			_, err := s.Recent(sc.scope, cfg.scopeK)
+			return err
+		}
+		for i := 0; i < cfg.warmup; i++ {
+			if err := call(); err != nil {
+				return err
+			}
+		}
+		xs := make([]float64, 0, cfg.runs)
+		for i := 0; i < cfg.runs; i++ {
+			t0 := time.Now()
+			if err := call(); err != nil {
+				return err
+			}
+			xs = append(xs, ms(t0))
+		}
+		printSpread(fmt.Sprintf("Recent(%q, %d)", sc.scope, cfg.scopeK), sc.n, xs)
+	}
 	fmt.Println()
 	return nil
 }

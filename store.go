@@ -78,18 +78,20 @@ type Store struct {
 	dim      int
 }
 
-// schemaVersion is the schema_version row's current value: 5, the porter
+// schemaVersion is the schema_version row's current value: 6, the porter
 // tokenizer on the FTS index over the v3 format (unix-nanosecond timestamps
-// plus the slice-3 provenance columns) with the (origin, origin_id) unique
-// index over those columns. Version 4 (same format, no unique index), version 3
-// (default tokenizer) and version 2 (no provenance) are upgraded on Open,
-// through the same path that creates the index and, for a v2 or v3 file,
-// rebuilds record_fts;
-// version 1 (unix seconds, written by the first slice release, 5aa287a) is
-// refused, never misread; a file stamped with anything else is refused on
-// Open, never silently migrated or misread. Keep the INSERT literal in schema
-// equal to this; TestSchemaVersion pins both.
-const schemaVersion = 5
+// plus the slice-3 provenance columns), the (origin, origin_id) unique index
+// over those columns, and idx_memory_scope_recent, the index over
+// (scope, deleted_at, ts DESC, id DESC) that serves a scope listing's
+// predicate and its ORDER BY with no temp b-tree. Version 5 (no scope index),
+// version 4 (no unique provenance index), version 3 (default tokenizer) and
+// version 2 (no provenance) are upgraded on Open, through the same path that
+// creates the indexes and, for a v2 or v3 file, rebuilds record_fts; version 1
+// (unix seconds, written by the first slice release, 5aa287a) is refused, never
+// misread; a file stamped with anything else is refused on Open, never silently
+// migrated or misread. Keep the INSERT literal in schema equal to this;
+// TestSchemaVersion pins both.
+const schemaVersion = 6
 
 // busyTimeout is how long a statement waits for the file's write lock before
 // it fails. It is named once because two places set the same bound — the
@@ -150,7 +152,7 @@ END;
 
 CREATE TABLE IF NOT EXISTS schema_version (version INTEGER NOT NULL);
 INSERT INTO schema_version(version)
-	SELECT 5 WHERE NOT EXISTS (SELECT 1 FROM schema_version);
+	SELECT 6 WHERE NOT EXISTS (SELECT 1 FROM schema_version);
 `
 
 // vecSchema is record_vec, the optional projection behind the vector matcher.
@@ -199,9 +201,9 @@ func Open(path string) (*Store, error) {
 	}
 	// Refuse a file stamped with a schema_version we do not expect before
 	// anything touches it — no WAL, no schema write, no chmod. The recognized
-	// versions are 2, 3 and 4 (previous formats, upgraded below) and the current
-	// one; a version-1 file stores ts in seconds, not nanoseconds, and reading
-	// it as current would silently show 1970.
+	// versions are 2, 3, 4 and 5 (previous formats, upgraded below) and the
+	// current one; a version-1 file stores ts in seconds, not nanoseconds, and
+	// reading it as current would silently show 1970.
 	v := 0
 	var stamped int
 	if err := db.QueryRow(`SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'schema_version'`).Scan(&stamped); err != nil {
@@ -213,7 +215,7 @@ func Open(path string) (*Store, error) {
 			db.Close()
 			return nil, fmt.Errorf("memstore: read schema_version from %s: %w", path, err)
 		}
-		if v != 2 && v != 3 && v != 4 && v != schemaVersion {
+		if v != 2 && v != 3 && v != 4 && v != 5 && v != schemaVersion {
 			db.Close()
 			return nil, fmt.Errorf("memstore: open %s: schema_version is %d, want %d (porter-tokenized FTS index)", path, v, schemaVersion)
 		}
@@ -325,6 +327,25 @@ func Open(path string) (*Store, error) {
 				db.Close()
 				return nil, fmt.Errorf("memstore: upgrade %s: create unique index idx_memory_origin_origin_id: %w", path, err)
 			}
+			// The scope index is what makes a scope listing cost what a scope
+			// listing should. Recent's predicate is deleted_at IS NULL plus an
+			// optional scope equality, and its ORDER BY is ts DESC, id DESC; the
+			// column order below puts both equality constraints first and the
+			// sort columns after them, so one index serves the whole query — a
+			// SEARCH with no temp b-tree. Measured on a copy of the live store
+			// (5094 rows) this took Recent('fs:cap', 1<<20) from p50 30.96 ms to
+			// p50 6.68 ms, the decode floor. Without the index SQLite sorts the
+			// full-width rows in a temp b-tree, which is the cost. It is not a
+			// UNIQUE index, so it cannot fail on rows a file already holds; it is
+			// created here, under the version bump, so an existing file gains it.
+			// The error still names it, the rule the provenance index set: a
+			// failure here (a file already carrying an object of this name) must
+			// never be swallowed.
+			if _, err := tx.Exec(`CREATE INDEX IF NOT EXISTS idx_memory_scope_recent ON memory(scope, deleted_at, ts DESC, id DESC)`); err != nil {
+				tx.Rollback()
+				db.Close()
+				return nil, fmt.Errorf("memstore: upgrade %s: create index idx_memory_scope_recent: %w", path, err)
+			}
 			// A file stamped 2 or 3 carries record_fts built with the default
 			// tokenizer, and FTS5 bakes the tokenizer into the table at CREATE.
 			// Drop and recreate the index with the porter stemmer, then rebuild
@@ -354,7 +375,7 @@ func Open(path string) (*Store, error) {
 					}
 				}
 			}
-			if _, err := tx.Exec(`UPDATE schema_version SET version = ? WHERE version IN (2, 3, 4)`, schemaVersion); err != nil {
+			if _, err := tx.Exec(`UPDATE schema_version SET version = ? WHERE version IN (2, 3, 4, 5)`, schemaVersion); err != nil {
 				tx.Rollback()
 				db.Close()
 				return nil, fmt.Errorf("memstore: upgrade %s: %w", path, err)
@@ -677,6 +698,12 @@ func (s *Store) Forget(id int64) error {
 // Recent returns up to k memories by time — newest ts first — optionally
 // restricted to one scope. Forgotten rows are excluded and k <= 0 is an empty
 // result. It never ranks by meaning; that is Search's job.
+//
+// The query is written to match idx_memory_scope_recent — deleted_at IS NULL,
+// an optional scope equality, and ORDER BY ts DESC, id DESC — so SQLite answers
+// it from the index with no temp b-tree. Changing the ORDER BY, dropping the
+// deleted_at literal, or adding a column between them silently gives that back;
+// TestRecentScopeListingUsesIndex fails if the plan regresses.
 func (s *Store) Recent(scope string, k int) ([]Memory, error) {
 	if k <= 0 {
 		return nil, nil

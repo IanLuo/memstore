@@ -44,10 +44,16 @@ nix develop --command go run ./cmd/bench
   mistaken forget needs raw SQL.
 - **FTS is external-content**: the text is stored once, never copied into the index;
   the index is tokenized by the porter stemmer.
-- **`schema_version` is 5.** The porter tokenizer is baked into `record_fts` at
+- **`schema_version` is 6.** The porter tokenizer is baked into `record_fts` at
   CREATE, so `Open` rebuilds the index from `memory` when it upgrades a v3 (or v2)
   file; a v1 file is refused rather than silently read as 1970. v4 → 5 adds the
-  partial unique index on `(origin, origin_id)` and changes nothing else.
+  partial unique index on `(origin, origin_id)`; v5 → 6 adds
+  `idx_memory_scope_recent` over `(scope, deleted_at, ts DESC, id DESC)`.
+- **A scope listing rides the index.** `Recent(scope, k)`'s predicate and its
+  `ORDER BY ts DESC, id DESC` are one `SEARCH` on `idx_memory_scope_recent`, with
+  no temp b-tree. Change the ORDER BY or drop the `deleted_at IS NULL` literal and
+  the read falls back to scanning and sorting full-width rows — the plan test
+  fails first.
 - **Provenance is content, and `(origin, origin_id)` is unique when it is set.**
   `Put` writes the four fields it is handed — an empty `origin` becomes `native`,
   and an empty `origin_id`, `ref` or `fs_node` becomes NULL — and refuses a

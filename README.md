@@ -67,9 +67,10 @@ These are not caveats to read past; they bound what the store can do.
   There is no search by meaning.
 - **`forget` is one-way.** It sets `deleted_at`; no verb restores it. A mistaken
   `forget` needs raw SQL.
-- **`schema_version` is 5.** `Open` upgrades an older file: a v2/v3 file has its
-  FTS index rebuilt, and v4 → 5 adds the unique index over `(origin, origin_id)`.
-  A v1 file is refused rather than read as 1970.
+- **`schema_version` is 6.** `Open` upgrades an older file: a v2/v3 file has its
+  FTS index rebuilt, v4 → 5 adds the unique index over `(origin, origin_id)`, and
+  v5 → 6 adds `idx_memory_scope_recent`, which serves a scope listing's predicate
+  and its sort order in one index. A v1 file is refused rather than read as 1970.
 - **Content is immutable.** Only `status`, `deleted_at` and `tier` change after a
   `put`. A correction is a new row plus `close`, never an update.
 - **One writer at a time.** One local file, no server, no network.
