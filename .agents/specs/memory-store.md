@@ -1,3 +1,5 @@
+<!-- specs:locked:638dae0 2026-10-31 type=spec -->
+
 ## Link contract
 - **upstream** (this doc relies on): none
 - **referrers** (must cite this when they change): .agents/specs/memory-store-design.md, .agents/dispatch/memstore-web-ui.md
