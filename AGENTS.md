@@ -4,7 +4,7 @@
 
 A portable memory store: one SQLite file holding every memory, so knowledge crosses
 the session and the repo boundary. A fuzzy query must return the right memory in the
-top 5 when the exact words are absent. CLI only, single user, no server.
+top 5 when the exact words are absent. One local user; `serve` is a read-only loopback view over existing CLI reads.
 
 ## How to run / build / test
 
@@ -19,7 +19,7 @@ nix develop
 nix develop --command go build -o /tmp/memstore ./cmd/memstore
 nix develop --command go test ./...
 nix develop --command go vet ./...
-nix develop --command gofmt -l cmd *.go   # prints nothing — vendor/ excluded; only gofmt walks it
+nix develop --command gofmt -l cmd *.go web/*.go   # prints nothing — vendor/ excluded; only gofmt walks it
 
 # Run — the store is $MEMSTORE_DB, or ~/.memstore/memory.db
 /tmp/memstore put -kind decision "text"
@@ -36,8 +36,9 @@ nix develop --command go run ./cmd/bench
   returns it, best first. With zero shared stems and no embedder, the store
   returns fewer results, never a wrong one. The vector matcher is absent unless
   `SetEmbedder` is called; do not call the lexical path "search by meaning".
-- **The verb surface is frozen**: `put get search recent link close forget stats
-  import`. The CLI carries no logic — it parses, calls the store, prints.
+- **The CLI verb surface is frozen**: `put get search recent link close forget stats
+  import`. `serve` starts the read-only UI; UI reads map only to existing
+  `Stats`, `Recent`, `Search`, and `Get` package methods.
 - **Content is immutable.** Only `status`, `deleted_at` and `tier` change after a
   put. A correction is a new row plus `close`, never an update.
 - **`forget` is one-way.** It sets `deleted_at`, and no verb restores it — a
@@ -59,27 +60,27 @@ nix develop --command go run ./cmd/bench
   and an empty `origin_id`, `ref` or `fs_node` becomes NULL — and refuses a
   duplicate pair with `ErrDuplicateOrigin`, so a caller decides whether a re-run
   is a skip. The index is partial: NULL `origin_id` never collides.
-- **One writer at a time.** One local file, no server, no network.
+- **One writer at a time.** One local file; `serve` binds to loopback and exposes no write route or network listener.
 - **A commit invalidates the locked specs.** `check-specs.sh` measures the whole
   project, so any commit past the sha a marker names refuses the `code` entry gate;
   a change to store behaviour must re-lock in the same dispatch.
 
 ## Architecture elevator
 
-Store owns the `memory` table and its lifecycle, and refuses ranking and HTTP.
-Matchers own recall fusion and refuse writing. The CLI owns the verb surface and
-refuses business logic. `web` owns the loopback listener and the page, and
-refuses to touch the file directly. `Put` and the Importer both write the
-provenance columns, from opposite directions: a caller's value, or fs's event.
+Store owns the `memory` table and lifecycle. Matchers own recall ranking and
+refuse writing. The CLI owns the verbs and carries no business logic. `web` owns
+the loopback listener and page, and uses only the public `Search`, `Recent`,
+`Get` and `Stats` methods; it does not add a database interface. `Put` and the
+Importer write provenance from opposite directions: caller values or fs events.
 
 ```
-cmd/memstore/     — the CLI: parse args, call the store, print JSON. No logic.
-cmd/bench/        — the NFR harness: p50/p95 at 1x and 10x, recall probes, size.
-store.go          — Store: schema, the lifecycle verbs, Query, import, projections.
-matchers.go       — Matchers: lexical ∪ relation-walk ∪ optional vector, read-only.
-web/              — the read-only UI: Handler, security guard, embedded index.html.
-.agents/specs/    — the locked contract and its system design.
-.agents/dispatch/ — the card each slice was built from.
+cmd/memstore/     — CLI: parse args, call store, print JSON; serve starts web.
+cmd/bench/        — NFR harness: p50/p95, recall probes, size.
+store.go          — schema, lifecycle verbs, Search/Recent/Get/Stats, import.
+matchers.go       — lexical ∪ optional vector ranking and related edges; read-only.
+web/              — read-only loopback UI using existing public store methods.
+.agents/specs/    — locked contract and system design.
+.agents/dispatch/ — task cards.
 ```
 
 ## Deeper docs

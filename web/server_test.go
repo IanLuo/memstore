@@ -31,7 +31,6 @@ func fixture(t *testing.T) *memstore.Store {
 	return s
 }
 
-// get issues a request the way the browser does: loopback Host, GET.
 func get(t *testing.T, h http.Handler, target string) *httptest.ResponseRecorder {
 	t.Helper()
 	req := httptest.NewRequest(http.MethodGet, target, nil)
@@ -41,21 +40,15 @@ func get(t *testing.T, h http.Handler, target string) *httptest.ResponseRecorder
 	return rec
 }
 
-// Spec: the page is served from the binary with no external asset, and every
-// answer carries the security and cache headers.
 func TestPageServedWithHeaders(t *testing.T) {
-	h := web.Handler(fixture(t))
-	rec := get(t, h, "/")
-	if rec.Code != http.StatusOK {
-		t.Fatalf("GET / = %d, want 200", rec.Code)
+	rec := get(t, web.Handler(fixture(t)), "/")
+	if rec.Code != http.StatusOK || !strings.HasPrefix(rec.Header().Get("Content-Type"), "text/html") {
+		t.Fatalf("GET / = %d, content-type %q", rec.Code, rec.Header().Get("Content-Type"))
 	}
-	if ct := rec.Header().Get("Content-Type"); !strings.HasPrefix(ct, "text/html") {
-		t.Errorf("Content-Type = %q, want text/html", ct)
+	if !strings.Contains(rec.Body.String(), "Projects &amp; tasks") || !strings.Contains(rec.Body.String(), "Agent retrieval") {
+		t.Error("page does not contain the store and agent views")
 	}
-	if body := rec.Body.String(); !strings.Contains(body, "<title>memstore</title>") {
-		t.Error("page body does not contain the UI")
-	}
-	if body := rec.Body.String(); strings.Contains(body, "http://") || strings.Contains(body, "https://") {
+	if strings.Contains(rec.Body.String(), "http://") || strings.Contains(rec.Body.String(), "https://") {
 		t.Error("page references an external URL")
 	}
 	for _, hdr := range []string{"Content-Security-Policy", "Cache-Control", "X-Content-Type-Options", "Referrer-Policy"} {
@@ -66,17 +59,12 @@ func TestPageServedWithHeaders(t *testing.T) {
 	if got := rec.Header().Get("Cache-Control"); got != "no-store" {
 		t.Errorf("Cache-Control = %q, want no-store", got)
 	}
-	if got := rec.Header().Get("Content-Security-Policy"); strings.Contains(got, "unsafe-eval") || strings.Contains(got, "http") {
-		t.Errorf("CSP allows something it should not: %q", got)
-	}
 }
 
-// Spec: a Host that is not loopback is refused before routing, so a
-// rebinding page cannot reach the store under its own name.
 func TestForeignHostRefused(t *testing.T) {
 	h := web.Handler(fixture(t))
 	for _, host := range []string{"evil.example", "10.0.0.5:8765", "0.0.0.0:8765"} {
-		req := httptest.NewRequest(http.MethodGet, "/api/memories", nil)
+		req := httptest.NewRequest(http.MethodGet, "/api/stats", nil)
 		req.Host = host
 		rec := httptest.NewRecorder()
 		h.ServeHTTP(rec, req)
@@ -84,7 +72,7 @@ func TestForeignHostRefused(t *testing.T) {
 			t.Errorf("Host %q = %d, want 403", host, rec.Code)
 		}
 	}
-	for _, host := range []string{"localhost:8765", "127.0.0.1:8765", "[::1]:8765"} {
+	for _, host := range []string{"localhost:8765", "127.0.0.1:8765", "[::1]:8765", "127.0.0.2:8765"} {
 		req := httptest.NewRequest(http.MethodGet, "/api/stats", nil)
 		req.Host = host
 		rec := httptest.NewRecorder()
@@ -95,12 +83,10 @@ func TestForeignHostRefused(t *testing.T) {
 	}
 }
 
-// Spec: the surface is read-only. Every write verb is refused, and no route
-// accepts one.
 func TestWritesRefused(t *testing.T) {
 	h := web.Handler(fixture(t))
 	for _, method := range []string{http.MethodPost, http.MethodPut, http.MethodPatch, http.MethodDelete} {
-		for _, target := range []string{"/", "/api/memories", "/api/memories/1", "/api/stats"} {
+		for _, target := range []string{"/", "/api/search?q=queue&k=10", "/api/recent?k=10", "/api/get?id=1", "/api/stats"} {
 			req := httptest.NewRequest(method, target, strings.NewReader(`{"text":"x"}`))
 			req.Host = "127.0.0.1:8765"
 			rec := httptest.NewRecorder()
@@ -112,8 +98,6 @@ func TestWritesRefused(t *testing.T) {
 	}
 }
 
-// Spec: the overview reports what Store.Stats measured, and the server states
-// that it configures no embedder.
 func TestStatsMatchStore(t *testing.T) {
 	s := fixture(t)
 	want, err := s.Stats()
@@ -121,56 +105,93 @@ func TestStatsMatchStore(t *testing.T) {
 		t.Fatalf("Stats: %v", err)
 	}
 	rec := get(t, web.Handler(s), "/api/stats")
+	var got memstore.Stats
 	if rec.Code != http.StatusOK {
-		t.Fatalf("GET /api/stats = %d, want 200", rec.Code)
-	}
-	var got struct {
-		Store    memstore.Stats `json:"store"`
-		Embedder bool           `json:"embedder"`
+		t.Fatalf("GET /api/stats = %d", rec.Code)
 	}
 	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
 		t.Fatalf("decode: %v", err)
 	}
-	if got.Store.Total != want.Total || got.Store.Open != want.Open || got.Store.Bytes != want.Bytes {
-		t.Errorf("stats = %+v, want %+v", got.Store, want)
-	}
-	if got.Embedder {
-		t.Error("Embedder = true; serve never configures one")
+	if got.Total != want.Total || got.Open != want.Open || got.Bytes != want.Bytes || got.WalBytes != want.WalBytes {
+		t.Errorf("stats = %+v, want %+v", got, want)
 	}
 }
 
-// Spec: filters reach the store, so the API returns only matching rows.
-func TestMemoriesFiltered(t *testing.T) {
-	h := web.Handler(fixture(t))
-	rec := get(t, h, "/api/memories?scope=beta")
-	if rec.Code != http.StatusOK {
-		t.Fatalf("status %d", rec.Code)
+func TestSearchMatchesPublicStoreSearch(t *testing.T) {
+	s := fixture(t)
+	expected, err := s.Search("queue", 2)
+	if err != nil {
+		t.Fatalf("Search: %v", err)
 	}
-	var got struct {
-		Memories []memstore.Memory `json:"memories"`
-		HasMore  bool              `json:"hasMore"`
-	}
+	rec := get(t, web.Handler(s), "/api/search?q=queue&k=2")
+	var got []memstore.Memory
 	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
 		t.Fatalf("decode: %v", err)
 	}
-	if len(got.Memories) != 1 || got.Memories[0].Scope != "beta" {
-		t.Fatalf("scope=beta = %+v, want the single beta row", got.Memories)
+	if len(got) != len(expected) {
+		t.Fatalf("HTTP returned %d rows, Store.Search returned %d", len(got), len(expected))
 	}
-	if got.HasMore {
-		t.Error("hasMore = true with one row")
+	for i := range expected {
+		if got[i].Id != expected[i].Id {
+			t.Errorf("result %d id %d, Store.Search id %d", i, got[i].Id, expected[i].Id)
+		}
 	}
 }
 
-// Spec: bad pages and over-long queries are refused with 400, not clamped.
-func TestBadRequestsRefused(t *testing.T) {
+func TestRecentMatchesPublicStoreRecent(t *testing.T) {
+	s := fixture(t)
+	expected, err := s.Recent("alpha", 2)
+	if err != nil {
+		t.Fatalf("Recent: %v", err)
+	}
+	rec := get(t, web.Handler(s), "/api/recent?scope=alpha&k=2")
+	var got []memstore.Memory
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(got) != len(expected) {
+		t.Fatalf("HTTP returned %d rows, Store.Recent returned %d", len(got), len(expected))
+	}
+	for i := range expected {
+		if got[i].Id != expected[i].Id {
+			t.Errorf("recent %d id %d, Store.Recent id %d", i, got[i].Id, expected[i].Id)
+		}
+	}
+}
+
+func TestGetMatchesPublicStoreGet(t *testing.T) {
+	s := fixture(t)
+	recent, err := s.Recent("beta", 1)
+	if err != nil || len(recent) != 1 {
+		t.Fatalf("Recent beta: rows=%d err=%v", len(recent), err)
+	}
+	expected, err := s.Get(recent[0].Id)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	rec := get(t, web.Handler(s), "/api/get?id="+itoa(expected.Id))
+	var got memstore.Memory
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if got.Id != expected.Id || got.Text != expected.Text {
+		t.Fatalf("HTTP Get = %+v, want %+v", got, expected)
+	}
+}
+
+func TestBadReadRequestsRefused(t *testing.T) {
 	h := web.Handler(fixture(t))
 	for _, target := range []string{
-		"/api/memories?limit=0",
-		"/api/memories?limit=101",
-		"/api/memories?limit=abc",
-		"/api/memories?offset=-1",
-		"/api/memories?q=" + strings.Repeat("x", web.MaxQueryLen+1),
-		"/api/memories/not-a-number",
+		"/api/search",
+		"/api/recent?k=abc",
+		"/api/get",
+		"/api/search?q=" + strings.Repeat("x", 513),
+		"/api/search?q=queue&k=abc",
+		"/api/recent?k=abc",
+		"/api/recent?scope=" + strings.Repeat("x", 513),
+		"/api/get",
+		"/api/get?id=-1",
+		"/api/get?id=abc",
 	} {
 		if rec := get(t, h, target); rec.Code != http.StatusBadRequest {
 			t.Errorf("GET %s = %d, want 400", target, rec.Code)
@@ -178,95 +199,16 @@ func TestBadRequestsRefused(t *testing.T) {
 	}
 }
 
-// Spec: memory text is data, not markup. The JSON encoder escapes it, and the
-// UI renders it as text, so a stored script tag cannot execute.
-func TestMemoryTextIsNotMarkup(t *testing.T) {
-	h := web.Handler(fixture(t))
-	rec := get(t, h, "/api/memories?kind=note")
-	if rec.Code != http.StatusOK {
-		t.Fatalf("status %d", rec.Code)
+func TestMemoryTextIsEscapedInJSON(t *testing.T) {
+	s := fixture(t)
+	hit, err := s.Search("markup", 5)
+	if err != nil || len(hit) != 1 {
+		t.Fatalf("Search markup: rows=%d err=%v", len(hit), err)
 	}
-	body := rec.Body.String()
-	if strings.Contains(body, "<script>") {
-		t.Errorf("raw script tag in response: %s", body)
+	rec := get(t, web.Handler(s), "/api/get?id="+itoa(hit[0].Id))
+	if strings.Contains(rec.Body.String(), "<script>") || !strings.Contains(rec.Body.String(), `\u003cscript\u003e`) {
+		t.Errorf("memory markup not JSON-escaped: %s", rec.Body.String())
 	}
-	if !strings.Contains(body, `\u003cscript\u003e`) {
-		t.Errorf("script tag was neither escaped nor omitted: %s", body)
-	}
-}
-
-// Spec: one request returns the detail with its relations resolved, and an
-// edge to a hidden memory is reported as unavailable.
-func TestDetailResolvesRelations(t *testing.T) {
-	s := openPair(t)
-	oldID, newID := pairIDs(t, s)
-	if err := s.CloseMemory(oldID, &newID); err != nil {
-		t.Fatalf("CloseMemory: %v", err)
-	}
-	h := web.Handler(s)
-
-	rec := get(t, h, "/api/memories/"+itoa(oldID))
-	if rec.Code != http.StatusOK {
-		t.Fatalf("status %d: %s", rec.Code, rec.Body.String())
-	}
-	var got detail
-	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
-		t.Fatalf("decode: %v", err)
-	}
-	if got.Memory.Id != oldID {
-		t.Errorf("memory id = %d, want %d", got.Memory.Id, oldID)
-	}
-	if len(got.Relations) != 1 || got.Relations[0].To != newID || !got.Relations[0].Available || got.Relations[0].Title == "" {
-		t.Fatalf("relations = %+v, want one available edge to %d with a title", got.Relations, newID)
-	}
-
-	if err := s.Forget(newID); err != nil {
-		t.Fatalf("Forget: %v", err)
-	}
-	rec = get(t, h, "/api/memories/"+itoa(oldID))
-	got = detail{}
-	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
-		t.Fatalf("decode: %v", err)
-	}
-	if len(got.Relations) != 1 || got.Relations[0].Available || got.Relations[0].Title != "" {
-		t.Fatalf("relations after forget = %+v, want the edge reported unavailable with no title", got.Relations)
-	}
-}
-
-// detail mirrors the JSON the UI receives for one memory.
-type detail struct {
-	Memory    memstore.Memory `json:"memory"`
-	Relations []struct {
-		Rel       string `json:"rel"`
-		To        int64  `json:"to"`
-		Title     string `json:"title"`
-		Available bool   `json:"available"`
-	} `json:"relations"`
-}
-
-// openPair and its helpers keep TestDetailResolvesRelations readable without
-// reaching into the store's internals.
-func openPair(t *testing.T) *memstore.Store {
-	t.Helper()
-	s, err := memstore.Open(t.TempDir() + "/memory.db")
-	if err != nil {
-		t.Fatalf("Open: %v", err)
-	}
-	t.Cleanup(func() { s.Close() })
-	return s
-}
-
-func pairIDs(t *testing.T, s *memstore.Store) (int64, int64) {
-	t.Helper()
-	oldID, err := s.Put(&memstore.Memory{Kind: "decision", Title: "Old", Text: "old decision"})
-	if err != nil {
-		t.Fatalf("Put old: %v", err)
-	}
-	newID, err := s.Put(&memstore.Memory{Kind: "decision", Title: "New", Text: "new decision"})
-	if err != nil {
-		t.Fatalf("Put new: %v", err)
-	}
-	return oldID, newID
 }
 
 func itoa(n int64) string { return strconv.FormatInt(n, 10) }

@@ -43,20 +43,18 @@ memstore serve -port 8790
 
 Four views over the same file:
 
-- **Memory library** — real search and exact `kind`/`scope`/`status`/`origin`
-  filters, paged results, and a detail panel with provenance and stored relations.
-- **Agent view** — the same query, shown as the candidates memstore would return,
-  with a rough text-size estimate (bytes ÷ 4). It is not a record of what an agent
-  received: prompt, context and cache state are unknown and shown as unknown.
-- **Store status** — live `stats` values, kept apart from static capability notes.
-- **Fresh-agent handoff** — a packet for an agent with no conversation history:
-  goal, checkout, current state, constraints, selected source memories, evidence,
-  risks and next action. It is built in the browser, never saved, and copied or
-  downloaded only when you ask.
+- **Projects & tasks** — recent records from `recent -k N [SCOPE]`. Shows the
+  stored kind and status; it does not infer project health or task completion.
+- **Agent retrieval** — exact results from `search -k N QUERY`, with their
+  memstore order. This does not show whether an agent ran the query or received
+  those memories. Prompt, context-window and provider-cache state are unavailable.
+- **Memory search** — the same `search` operation to inspect memories directly.
+- **Store status** — live values from `stats`, separated from static limits.
 
-The server is read-only: GET and HEAD, loopback `Host` only, no CORS, no external
-asset, `Cache-Control: no-store`. It reaches data through the Go package and never
-opens SQLite itself.
+Open a record to read it with `get ID`. Every view uses the same public memstore
+methods as a CLI caller. The server adds no query or database interface. It is
+read-only: GET and HEAD, loopback `Host` only, no CORS, no external assets, and
+`Cache-Control: no-store`. It never opens SQLite itself.
 
 ## Test
 

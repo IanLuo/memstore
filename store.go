@@ -66,20 +66,6 @@ type Related struct {
 	To  int64
 }
 
-// Filter selects live memories by exact field values, ANDed. An empty field
-// matches anything, so the zero Filter narrows nothing. Kind, scope and origin
-// are open labels, so a typo yields no rows rather than a refusal.
-type Filter struct {
-	Kind   string
-	Scope  string
-	Status string
-	Origin string
-}
-
-// MaxPageSize is the largest page Query will return; it is refused above this
-// rather than clamped, so a caller never mistakes a short page for the end.
-const MaxPageSize = 100
-
 // Store is an open memory file.
 type Store struct {
 	db   *sql.DB
@@ -585,67 +571,6 @@ func (s *Store) Search(q string, k int) ([]Memory, error) {
 		return nil, fmt.Errorf("memstore: search: %w", err)
 	}
 	return out, nil
-}
-
-// Query returns one bounded page of live memories, and whether more follow.
-//
-// A non-empty q ranks through the matchers exactly as Search does; an empty q
-// lists newest first by ts and id, which is what a filter-only request and the
-// UI's opening page ask for. The Filter fields are exact and ANDed, and they
-// reach the query before the limit does, so a matching row is never dropped by
-// truncating an unfiltered result. offset walks that same deterministic order;
-// one extra row is fetched to answer hasMore without a count query.
-//
-// A limit outside 1..MaxPageSize and a negative offset are errors, not clamped
-// values: a caller that asks for too much has a bug, and silently returning
-// less would hide it.
-func (s *Store) Query(q string, f Filter, limit, offset int) ([]Memory, bool, error) {
-	if limit < 1 || limit > MaxPageSize {
-		return nil, false, fmt.Errorf("memstore: query: limit %d is outside 1..%d", limit, MaxPageSize)
-	}
-	if offset < 0 {
-		return nil, false, fmt.Errorf("memstore: query: offset %d is negative", offset)
-	}
-	if q != "" {
-		out, hasMore, err := s.matchers.searchPage(q, f, limit, offset)
-		if err != nil {
-			return nil, false, fmt.Errorf("memstore: query: %w", err)
-		}
-		return out, hasMore, nil
-	}
-	where, args := filterClause(f)
-	sql := `SELECT ` + memoryCols + ` FROM memory WHERE deleted_at IS NULL` + where +
-		` ORDER BY ts DESC, id DESC LIMIT ? OFFSET ?`
-	args = append(args, limit+1, offset)
-	rows, err := s.db.Query(sql, args...)
-	if err != nil {
-		return nil, false, fmt.Errorf("memstore: query: %w", err)
-	}
-	defer rows.Close()
-	out, err := scanAll(rows)
-	if err != nil {
-		return nil, false, fmt.Errorf("memstore: query: %w", err)
-	}
-	hasMore := len(out) > limit
-	if hasMore {
-		out = out[:limit]
-	}
-	return out, hasMore, nil
-}
-
-// Relations returns the outgoing superseded-by and found-by edges of a live
-// memory — the same relations Search attaches to a hit. The edge is returned
-// by id even when its target is hidden, so a caller can report it as
-// unavailable rather than pretend it is not there.
-func (s *Store) Relations(id int64) ([]Related, error) {
-	if err := s.requireLive(id); err != nil {
-		return nil, fmt.Errorf("memstore: relations: %w", err)
-	}
-	rel, err := s.matchers.related(id)
-	if err != nil {
-		return nil, fmt.Errorf("memstore: relations: %w", err)
-	}
-	return rel, nil
 }
 
 // SetEmbedder registers the embedder behind vector recall. It is a post-Open

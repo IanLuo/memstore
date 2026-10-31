@@ -12,6 +12,7 @@ import (
 	"net"
 	"net/http"
 	"strconv"
+	"strings"
 
 	"github.com/IanLuo/memstore"
 )
@@ -19,26 +20,85 @@ import (
 //go:embed index.html
 var page embed.FS
 
-// DefaultLimit is the page size a request without a limit gets; MaxQueryLen
-// bounds the text query so one request cannot ask the index for a novel.
-const (
-	DefaultLimit = 20
-	MaxQueryLen  = 512
-)
+const maxQueryLen = 512
 
-// Handler serves the UI and its read-only API over store. It answers GET and
-// HEAD only; any other method gets 405 from the route patterns below.
+// Handler serves the UI and the same read operations exposed by the CLI:
+// Search, Recent, Get and Stats. It does not create a second data interface.
 func Handler(store *memstore.Store) http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /{$}", servePage)
 	mux.HandleFunc("GET /api/stats", func(w http.ResponseWriter, r *http.Request) {
-		serveStats(w, store)
+		st, err := store.Stats()
+		if err != nil {
+			fail(w, err)
+			return
+		}
+		writeJSON(w, st)
 	})
-	mux.HandleFunc("GET /api/memories", func(w http.ResponseWriter, r *http.Request) {
-		serveMemories(w, r, store)
+	mux.HandleFunc("GET /api/search", func(w http.ResponseWriter, r *http.Request) {
+		q := r.URL.Query().Get("q")
+		if q == "" {
+			http.Error(w, "memstore: search: empty query", http.StatusBadRequest)
+			return
+		}
+		if len(q) > maxQueryLen {
+			http.Error(w, fmt.Sprintf("memstore: query longer than %d bytes", maxQueryLen), http.StatusBadRequest)
+			return
+		}
+		k, err := intParam(r.URL.Query().Get("k"), 10)
+		if err != nil {
+			http.Error(w, "memstore: search: "+err.Error(), http.StatusBadRequest)
+			return
+		}
+		hits, err := store.Search(q, k)
+		if err != nil {
+			fail(w, err)
+			return
+		}
+		if hits == nil {
+			hits = []memstore.Memory{}
+		}
+		writeJSON(w, hits)
 	})
-	mux.HandleFunc("GET /api/memories/{id}", func(w http.ResponseWriter, r *http.Request) {
-		serveMemory(w, r, store)
+	mux.HandleFunc("GET /api/recent", func(w http.ResponseWriter, r *http.Request) {
+		q := r.URL.Query()
+		k, err := intParam(q.Get("k"), 20)
+		if err != nil {
+			http.Error(w, "memstore: recent: "+err.Error(), http.StatusBadRequest)
+			return
+		}
+		scope := q.Get("scope")
+		if len(scope) > maxQueryLen {
+			http.Error(w, "memstore: recent: scope is too long", http.StatusBadRequest)
+			return
+		}
+		rows, err := store.Recent(scope, k)
+		if err != nil {
+			fail(w, err)
+			return
+		}
+		if rows == nil {
+			rows = []memstore.Memory{}
+		}
+		writeJSON(w, rows)
+	})
+	mux.HandleFunc("GET /api/get", func(w http.ResponseWriter, r *http.Request) {
+		idValue, ok := r.URL.Query()["id"]
+		if !ok || len(idValue) == 0 {
+			http.Error(w, "memstore: get: missing id", http.StatusBadRequest)
+			return
+		}
+		id, err := strconv.ParseInt(idValue[0], 10, 64)
+		if err != nil || id <= 0 {
+			http.Error(w, "memstore: get: bad id", http.StatusBadRequest)
+			return
+		}
+		m, err := store.Get(id)
+		if err != nil {
+			fail(w, err)
+			return
+		}
+		writeJSON(w, m)
 	})
 	return guard(mux)
 }
@@ -70,11 +130,10 @@ func loopbackHost(hostport string) bool {
 	if h, _, err := net.SplitHostPort(hostport); err == nil {
 		host = h
 	}
-	switch host {
-	case "127.0.0.1", "localhost", "::1":
-		return true
+	if ip := net.ParseIP(host); ip != nil {
+		return ip.IsLoopback()
 	}
-	return false
+	return strings.EqualFold(host, "localhost")
 }
 
 func servePage(w http.ResponseWriter, r *http.Request) {
@@ -84,115 +143,10 @@ func servePage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	w.Write(body)
+	_, _ = w.Write(body)
 }
 
-// statsResponse separates what the store measured from what this process is
-// configured with. Embedder is always false: serve never registers one.
-type statsResponse struct {
-	Store    memstore.Stats `json:"store"`
-	Embedder bool           `json:"embedder"`
-}
-
-func serveStats(w http.ResponseWriter, store *memstore.Store) {
-	st, err := store.Stats()
-	if err != nil {
-		fail(w, err)
-		return
-	}
-	writeJSON(w, statsResponse{Store: st, Embedder: false})
-}
-
-// memoriesResponse is one page of results. HasMore is answered by the store
-// fetching one row beyond the page, not by a separate count.
-type memoriesResponse struct {
-	Memories []memstore.Memory `json:"memories"`
-	HasMore  bool              `json:"hasMore"`
-}
-
-func serveMemories(w http.ResponseWriter, r *http.Request, store *memstore.Store) {
-	q := r.URL.Query()
-	text := q.Get("q")
-	if len(text) > MaxQueryLen {
-		http.Error(w, fmt.Sprintf("memstore: query longer than %d bytes", MaxQueryLen), http.StatusBadRequest)
-		return
-	}
-	limit, err := intParam(q.Get("limit"), DefaultLimit)
-	if err != nil {
-		http.Error(w, "memstore: "+err.Error(), http.StatusBadRequest)
-		return
-	}
-	if limit < 1 || limit > memstore.MaxPageSize {
-		http.Error(w, fmt.Sprintf("memstore: limit must be 1..%d", memstore.MaxPageSize), http.StatusBadRequest)
-		return
-	}
-	offset, err := intParam(q.Get("offset"), 0)
-	if err != nil {
-		http.Error(w, "memstore: "+err.Error(), http.StatusBadRequest)
-		return
-	}
-	filter := memstore.Filter{
-		Kind:   q.Get("kind"),
-		Scope:  q.Get("scope"),
-		Status: q.Get("status"),
-		Origin: q.Get("origin"),
-	}
-	hits, hasMore, err := store.Query(text, filter, limit, offset)
-	if err != nil {
-		fail(w, err)
-		return
-	}
-	if hits == nil {
-		hits = []memstore.Memory{}
-	}
-	writeJSON(w, memoriesResponse{Memories: hits, HasMore: hasMore})
-}
-
-// relationView is one stored edge with its target's label, resolved so a page
-// needs one request. A target the store will not show is unavailable, and
-// carries no title: the edge is reported, its content is not invented.
-type relationView struct {
-	Rel       string `json:"rel"`
-	To        int64  `json:"to"`
-	Title     string `json:"title,omitempty"`
-	Kind      string `json:"kind,omitempty"`
-	Available bool   `json:"available"`
-}
-
-type memoryResponse struct {
-	Memory    memstore.Memory `json:"memory"`
-	Relations []relationView  `json:"relations"`
-}
-
-func serveMemory(w http.ResponseWriter, r *http.Request, store *memstore.Store) {
-	id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
-	if err != nil {
-		http.Error(w, "memstore: bad memory id", http.StatusBadRequest)
-		return
-	}
-	m, err := store.Get(id)
-	if err != nil {
-		fail(w, err)
-		return
-	}
-	edges, err := store.Relations(id)
-	if err != nil {
-		fail(w, err)
-		return
-	}
-	out := memoryResponse{Memory: m, Relations: make([]relationView, 0, len(edges))}
-	for _, edge := range edges {
-		view := relationView{Rel: edge.Rel, To: edge.To}
-		if target, err := store.Get(edge.To); err == nil {
-			view.Title, view.Kind, view.Available = target.Title, target.Kind, true
-		}
-		out.Relations = append(out.Relations, view)
-	}
-	writeJSON(w, out)
-}
-
-// intParam reads a non-negative integer parameter, defaulting when it is absent
-// and refusing anything else: a caller that sends a bad page has a bug.
+// intParam reads a non-negative integer parameter, defaulting when it is absent.
 func intParam(raw string, def int) (int, error) {
 	if raw == "" {
 		return def, nil
@@ -207,9 +161,6 @@ func intParam(raw string, def int) (int, error) {
 	return n, nil
 }
 
-// isInputError is gone: bounds are checked here, so a Store.Query error is the
-// store's own failure and answers 500.
-
 func writeJSON(w http.ResponseWriter, v any) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	enc := json.NewEncoder(w)
@@ -217,8 +168,7 @@ func writeJSON(w http.ResponseWriter, v any) {
 	_ = enc.Encode(v)
 }
 
-// fail answers a store failure. The detail goes to the local stderr, which the
-// operator runs; the client gets a message with no memory text and no query.
+// fail answers a Store failure without echoing memory contents to the browser.
 func fail(w http.ResponseWriter, err error) {
 	log.Printf("web: %v", err)
 	http.Error(w, "memstore: read failed", http.StatusInternalServerError)

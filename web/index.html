@@ -5,457 +5,190 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>memstore</title>
 <style>
-  :root {
-    color-scheme: light;
-    --paper: #f7f7f5; --surface: #fff; --ink: #20231f; --muted: #777d75;
-    --line: #e8e9e5; --accent: #486c5b; --accent-soft: #e9f0eb;
-    --shadow: 0 12px 35px rgba(29, 38, 31, .045);
-    font-family: Inter, ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-  }
-  * { box-sizing: border-box; }
-  body { margin: 0; color: var(--ink); background: var(--paper); font-size: 13px; }
-  button, input, select, textarea { font: inherit; }
-  button { color: inherit; }
-  .topbar { height: 66px; display: flex; align-items: center; justify-content: space-between; padding: 0 32px; border-bottom: 1px dashed #dfe2dc; background: rgba(255,255,255,.84); }
-  .brand { display: flex; align-items: center; gap: 10px; font-size: 14px; font-weight: 650; letter-spacing: -.025em; }
-  .mark { width: 24px; height: 24px; border: 1.5px solid var(--accent); border-radius: 8px 8px 8px 2px; position: relative; }
-  .mark:after { content: ""; position: absolute; width: 5px; height: 5px; border-radius: 50%; background: var(--accent); top: 8px; left: 8px; }
-  .top-right { display: flex; align-items: center; gap: 12px; color: var(--muted); font-size: 11px; }
-  .pill { padding: 6px 9px; border: 1px solid #e1e6e1; border-radius: 999px; color: #55715f; background: #f4f7f4; font-size: 11px; }
-  .layout { display: grid; grid-template-columns: 220px minmax(390px, 1fr) 365px; min-height: calc(100vh - 66px); max-width: 1600px; margin: 0 auto; }
-  .layout.wide { grid-template-columns: 220px minmax(0, 1fr); }
-  .layout.wide .detail { display: none; }
-  .sidebar { padding: 30px 18px 24px 24px; border-right: 1px dashed #dfe2dc; }
-  .side-label { margin: 0 0 12px 10px; color: #969b94; font-size: 10px; font-weight: 650; text-transform: uppercase; letter-spacing: .11em; }
-  .view-nav { display: grid; gap: 3px; margin-bottom: 27px; padding-bottom: 19px; border-bottom: 1px dashed #dfe2dc; }
-  .view-nav button { width: 100%; padding: 9px 10px; border: 0; border-radius: 7px; background: transparent; color: #555b54; text-align: left; cursor: pointer; }
-  .view-nav button:hover { background: #eeefeb; }
-  .view-nav button.active { background: var(--accent-soft); color: #315b45; font-weight: 600; }
-  .sidebar-note { margin: 20px 8px 0; color: #969b94; font-size: 11px; line-height: 1.55; }
-  .content { min-width: 0; padding: 36px 34px 60px; }
-  .heading-row { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; margin-bottom: 22px; }
-  h1 { margin: 0; font-family: Iowan Old Style, Georgia, serif; font-size: 31px; line-height: 1.1; font-weight: 500; letter-spacing: -.035em; }
-  .subtitle { margin-top: 8px; color: var(--muted); font-size: 12px; }
-  .search-wrap { position: relative; margin-bottom: 14px; }
-  .search-icon { position: absolute; left: 13px; top: 10px; color: #959b93; font-size: 15px; }
-  .search { display: block; width: 100%; height: 39px; padding: 0 12px 0 37px; border: 1px solid #e1e3de; border-radius: 7px; outline: none; background: var(--surface); color: var(--ink); }
-  .search:focus { border-color: #9cb1a1; box-shadow: 0 0 0 3px rgba(72,108,91,.09); }
-  .filters { display: flex; flex-wrap: wrap; gap: 8px; align-items: end; margin-bottom: 12px; }
-  .filters label { display: grid; gap: 4px; color: #899087; font-size: 10px; }
-  .filters input, .filters select { height: 30px; min-width: 96px; padding: 0 7px; border: 1px solid var(--line); border-radius: 5px; background: #fff; color: #444b44; font-size: 11px; }
-  .btn { height: 30px; padding: 0 11px; border: 1px solid #dce5dd; border-radius: 5px; background: var(--accent-soft); color: #3c644c; font-size: 11px; cursor: pointer; }
-  .btn.ghost { border-style: dashed; background: #fff; color: #6f776e; }
-  .hint { margin: 0 0 14px; color: #969b94; font-size: 10px; line-height: 1.5; }
-  .results-label { display: flex; justify-content: space-between; margin: 0 2px 9px; color: #929890; font-size: 11px; }
-  .results { display: grid; gap: 12px; }
-  .card { padding: 17px 18px 16px; border: 1px dashed #d9ded7; border-radius: 9px; background: var(--surface); cursor: pointer; }
-  .card:hover { border-color: #9caf9f; box-shadow: var(--shadow); }
-  .card.selected { border-style: solid; border-color: #9caf9f; }
-  .card-top { display: flex; justify-content: space-between; gap: 12px; }
-  .kind { color: var(--accent); font-size: 10px; font-weight: 650; letter-spacing: .08em; text-transform: uppercase; }
-  .date { color: #9a9f98; font-size: 10px; white-space: nowrap; }
-  .card h2 { margin: 8px 0 5px; font-size: 14px; line-height: 1.35; font-weight: 600; letter-spacing: -.015em; }
-  .excerpt { margin: 0; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; color: #71776f; font-size: 12px; line-height: 1.55; }
-  .card-bottom { display: flex; gap: 8px; margin-top: 11px; color: #8b9189; font-size: 10px; }
-  .empty { padding: 30px 18px; border: 1px dashed #dfe2dc; border-radius: 8px; color: #858b83; text-align: center; line-height: 1.6; }
-  .detail { padding: 35px 25px 48px; border-left: 1px dashed #dfe2dc; background: #fbfbfa; }
-  .detail-empty { display: grid; min-height: 50vh; place-items: center; color: #9a9f98; text-align: center; line-height: 1.6; }
-  .detail-kicker { color: var(--accent); font-size: 10px; font-weight: 650; letter-spacing: .1em; text-transform: uppercase; }
-  .detail h2 { margin: 12px 0 11px; font-family: Iowan Old Style, Georgia, serif; font-size: 25px; line-height: 1.17; font-weight: 500; letter-spacing: -.03em; }
-  .detail-time { margin-bottom: 23px; color: #90968e; font-size: 11px; }
-  .detail-body { color: #4e554e; font-size: 12px; line-height: 1.75; white-space: pre-wrap; overflow-wrap: anywhere; }
-  .section { margin-top: 27px; padding-top: 17px; border-top: 1px dashed #d9ded7; }
-  .section h3 { margin: 0 0 12px; color: #929890; font-size: 10px; font-weight: 650; letter-spacing: .1em; text-transform: uppercase; }
-  .meta-row { display: grid; grid-template-columns: 88px 1fr; gap: 12px; margin: 10px 0; font-size: 11px; }
-  .meta-label { color: #929890; }
-  .meta-value { color: #4f564e; overflow-wrap: anywhere; }
-  .link-item { display: flex; gap: 9px; padding: 8px 0; color: #55695a; font-size: 11px; line-height: 1.45; cursor: pointer; }
-  .link-item:hover { color: #294a36; }
-  .link-item.unavailable { color: #a0a59e; cursor: default; }
-  .panel { padding: 16px; border: 1px dashed #d9ded7; border-radius: 9px; background: #fff; }
-  .grid3 { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; margin: 20px 0 26px; }
-  .metric-label { color: #90968e; font-size: 10px; text-transform: uppercase; letter-spacing: .08em; }
-  .metric-value { margin-top: 9px; font-family: Iowan Old Style, Georgia, serif; font-size: 25px; }
-  .metric-note { margin-top: 5px; color: #8a9088; font-size: 10px; line-height: 1.5; }
-  .banner { padding: 13px 15px; border: 1px dashed #d9c9a9; border-radius: 8px; background: #fbf8f1; color: #776548; font-size: 11px; line-height: 1.6; }
-  .rows { display: grid; }
-  .row { display: grid; grid-template-columns: 175px 1fr; gap: 18px; padding: 11px 0; border-bottom: 1px dashed #dfe2dc; font-size: 11px; line-height: 1.5; }
-  .row strong { color: #555e55; font-weight: 600; }
-  .row span { color: #747b73; overflow-wrap: anywhere; }
-  .field { display: grid; gap: 6px; margin-bottom: 12px; }
-  .field > label { color: #7c847b; font-size: 10px; font-weight: 650; letter-spacing: .06em; text-transform: uppercase; }
-  .field input, .field textarea { width: 100%; padding: 10px 11px; border: 1px solid #e1e3de; border-radius: 6px; outline: none; background: #fff; color: var(--ink); font-size: 12px; line-height: 1.5; }
-  .field textarea { min-height: 74px; resize: vertical; }
-  .two { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
-  .sources { display: grid; gap: 7px; margin-bottom: 12px; }
-  .source { display: grid; grid-template-columns: 14px minmax(0, 1fr); gap: 9px; padding: 10px 11px; border: 1px dashed #d9ded7; border-radius: 6px; background: #fff; font-size: 11px; line-height: 1.45; cursor: pointer; }
-  .source small { display: block; margin-top: 3px; color: #969b94; font-size: 9px; }
-  .checks { display: grid; grid-template-columns: 1fr 1fr; gap: 7px 13px; margin-top: 10px; }
-  .checks label { display: flex; gap: 7px; color: #777e76; font-size: 10px; line-height: 1.45; }
-  .preview { margin-top: 13px; padding: 15px; border: 1px dashed #d9ded7; border-radius: 8px; background: #fff; color: #4d554d; font: 11px/1.65 ui-monospace, SFMono-Regular, Menlo, monospace; white-space: pre-wrap; overflow-wrap: anywhere; max-height: 460px; overflow: auto; }
-  .actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
-  @media (max-width: 1100px) {
-    .layout { grid-template-columns: 190px minmax(340px, 1fr) 320px; }
-    .content { padding: 28px 22px 50px; }
-    .detail { padding: 30px 18px 40px; }
-  }
-  @media (max-width: 820px) {
-    .layout { grid-template-columns: 180px minmax(0, 1fr); }
-    .detail { display: none; }
-    .detail.open { position: fixed; z-index: 5; inset: 66px 0 0; display: block; overflow-y: auto; padding: 22px 24px 50px; border-left: 0; }
-    .grid3 { grid-template-columns: 1fr; }
-  }
-  @media (max-width: 560px) {
-    .topbar { height: 58px; padding: 0 16px; }
-    .top-right span:not(.pill) { display: none; }
-    .layout { display: block; min-height: calc(100vh - 58px); }
-    .sidebar { padding: 10px 14px; border-right: 0; border-bottom: 1px dashed #dfe2dc; }
-    .side-label, .sidebar-note { display: none; }
-    .view-nav { display: flex; gap: 3px; margin: 0; padding: 0; border: 0; overflow-x: auto; }
-    .view-nav button { width: auto; min-width: max-content; padding: 8px 10px; }
-    .content { padding: 24px 15px 40px; }
-    h1 { font-size: 28px; }
-    .two, .checks { grid-template-columns: 1fr; }
-    .row { grid-template-columns: 1fr; gap: 4px; }
-    .detail.open { inset: 58px 0 0; padding: 18px 18px 45px; }
+  :root { color-scheme:light; --paper:#f7f7f5; --surface:#fff; --ink:#20231f; --muted:#777d75; --line:#e8e9e5; --accent:#486c5b; --accent-soft:#e9f0eb; font-family:Inter,ui-sans-serif,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; }
+  * { box-sizing:border-box; }
+  body { margin:0; color:var(--ink); background:var(--paper); font-size:13px; }
+  button,input,select { font:inherit; } button { color:inherit; }
+  .topbar { position:sticky; top:0; z-index:10; height:64px; display:flex; align-items:center; justify-content:space-between; padding:0 28px; border-bottom:1px dashed #dfe2dc; background:#fff; }
+  .brand { display:flex; align-items:center; gap:10px; font-size:14px; font-weight:650; }
+  .mark { position:relative; width:24px; height:24px; border:1.5px solid var(--accent); border-radius:8px 8px 8px 2px; }
+  .mark:after { position:absolute; content:""; width:5px; height:5px; top:8px; left:8px; border-radius:50%; background:var(--accent); }
+  .top-meta { display:flex; align-items:center; gap:12px; color:var(--muted); font-size:11px; }
+  .pill { padding:6px 9px; border:1px solid #e1e6e1; border-radius:999px; color:#55715f; background:#f4f7f4; }
+  .layout { display:grid; grid-template-columns:215px minmax(0,1fr); min-height:calc(100vh - 64px); max-width:1600px; margin:auto; }
+  .sidebar { position:sticky; top:64px; align-self:start; height:calc(100vh - 64px); padding:25px 16px 20px 22px; border-right:1px dashed #dfe2dc; background:var(--paper); }
+  .side-label { margin:0 0 10px 8px; color:#969b94; font-size:10px; font-weight:650; letter-spacing:.11em; text-transform:uppercase; }
+  .view-nav { display:grid; gap:3px; }
+  .view-nav button { width:100%; padding:10px; border:0; border-radius:7px; background:transparent; color:#555b54; text-align:left; cursor:pointer; }
+  .view-nav button:hover { background:#eeefeb; }
+  .view-nav button.active { background:var(--accent-soft); color:#315b45; font-weight:600; }
+  .sidebar-note { margin:22px 8px 0; color:#969b94; font-size:11px; line-height:1.55; }
+  main { min-width:0; padding:32px 36px 64px; }
+  .page[hidden] { display:none; }
+  h1 { margin:0; font:500 30px/1.12 Iowan Old Style,Georgia,serif; letter-spacing:-.035em; }
+  .subtitle { margin-top:8px; color:var(--muted); font-size:12px; line-height:1.55; }
+  .guide { margin:15px 0; padding:12px 14px; border:1px dashed #d9ded7; border-radius:8px; background:#fff; color:#626a61; font-size:11px; line-height:1.6; }
+  .guide strong { color:#3c644c; }
+  .guide ol { margin:5px 0 0; padding-left:19px; }
+  .searchbox { position:relative; margin:18px 0 10px; }
+  .search-icon { position:absolute; top:9px; left:12px; color:#959b93; font-size:16px; }
+  .search { width:100%; height:38px; padding:0 12px 0 35px; border:1px solid #e1e3de; border-radius:7px; outline:none; background:#fff; color:var(--ink); }
+  .search:focus,.filters input:focus,.filters select:focus { border-color:#9cb1a1; box-shadow:0 0 0 3px rgba(72,108,91,.08); }
+  .filters { display:flex; flex-wrap:wrap; align-items:end; gap:9px; margin:10px 0; }
+  .filters label { display:grid; gap:4px; color:#899087; font-size:10px; }
+  .filters input,.filters select { height:31px; min-width:108px; padding:0 8px; border:1px solid var(--line); border-radius:5px; background:#fff; color:#444b44; font-size:11px; }
+  .btn { min-height:32px; padding:0 11px; border:1px solid #dce5dd; border-radius:5px; background:var(--accent-soft); color:#3c644c; font-size:11px; cursor:pointer; }
+  .btn.ghost { border-style:dashed; background:#fff; color:#6f776e; }
+  .btn:focus-visible,.view-nav button:focus-visible { outline:2px solid #6c8f78; outline-offset:2px; }
+  .hint { margin:7px 0 14px; color:#929890; font-size:10px; line-height:1.55; }
+  .results-label { display:flex; justify-content:space-between; gap:12px; margin:12px 2px 9px; color:#929890; font-size:11px; }
+  .cards { display:grid; gap:10px; }
+  .card { padding:14px 16px; border:1px dashed #d9ded7; border-radius:8px; background:#fff; }
+  .card:hover { border-color:#9caf9f; }
+  .card-head { display:flex; justify-content:space-between; gap:10px; color:#8b9189; font-size:10px; }
+  .kind { display:inline-block; padding:3px 7px; border:1px solid hsl(var(--kind-hue,145) 28% 82%); border-radius:999px; color:hsl(var(--kind-hue,145) 38% 32%); background:hsl(var(--kind-hue,145) 42% 95%); font-size:9px; font-weight:700; letter-spacing:.07em; text-transform:uppercase; }
+  .kind-legend { display:flex; flex-wrap:wrap; gap:6px; margin:8px 2px 10px; }
+  .kind-legend .kind { font-size:9px; }
+  .picker-row { display:flex; flex-wrap:wrap; align-items:end; gap:9px; margin:10px 0 14px; }
+  .picker-row label { display:grid; flex:1 1 240px; gap:4px; color:#899087; font-size:10px; }
+  .picker-row select { width:100%; min-height:34px; padding:0 8px; border:1px solid var(--line); border-radius:5px; background:white; color:#444b44; font-size:11px; }
+  .picker-row .btn { min-height:34px; }
+  .picked-record { display:grid; gap:8px; margin:10px 0 14px; padding:12px 14px; border:1px dashed #d9ded7; border-radius:8px; background:#fff; }
+  .picked-record[hidden] { display:none; }
+  .picked-record strong { color:#3c644c; font-size:11px; }
+  .picked-record p { margin:0; color:#71776f; font-size:11px; line-height:1.55; }
+  .card h2 { margin:7px 0 5px; font-size:14px; line-height:1.4; font-weight:600; }
+  .excerpt { margin:0; color:#71776f; font-size:12px; line-height:1.6; white-space:pre-wrap; overflow-wrap:anywhere; }
+  .card-foot { display:flex; align-items:center; flex-wrap:wrap; gap:7px; margin-top:10px; color:#8b9189; font-size:10px; }
+  .card-foot .btn { margin-left:auto; }
+  .empty { padding:25px 17px; border:1px dashed #dfe2dc; border-radius:8px; color:#858b83; text-align:center; line-height:1.6; }
+  .row-list { display:grid; }
+  .row { display:grid; grid-template-columns:160px minmax(0,1fr); gap:16px; padding:11px 0; border-bottom:1px dashed #dfe2dc; font-size:11px; line-height:1.55; }
+  .row strong { color:#555e55; font-weight:600; }
+  .row span { color:#747b73; overflow-wrap:anywhere; }
+  .summary { display:flex; flex-wrap:wrap; gap:7px; margin:12px 0; }
+  .summary span { padding:5px 8px; border:1px dashed #d9ded7; border-radius:999px; background:#fff; color:#687068; font-size:10px; }
+  .summary button { padding:5px 8px; border:1px dashed #cfd7cf; border-radius:999px; background:#fff; color:#486c5b; font-size:10px; cursor:pointer; }
+  .metric-grid { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:10px; margin:20px 0; }
+  .metric { padding:15px; border:1px dashed #d9ded7; border-radius:8px; background:#fff; }
+  .metric-label { color:#90968e; font-size:10px; letter-spacing:.08em; text-transform:uppercase; }
+  .metric-value { margin-top:9px; font:500 24px Iowan Old Style,Georgia,serif; }
+  .metric-note { margin-top:5px; color:#8a9088; font-size:10px; line-height:1.5; }
+  .section { margin-top:20px; padding-top:14px; border-top:1px dashed #d9ded7; }
+  .section h3 { margin:0 0 9px; color:#929890; font-size:10px; letter-spacing:.09em; text-transform:uppercase; }
+  .memory-dialog { width:min(740px,calc(100vw - 28px)); max-height:82vh; padding:0; overflow:auto; border:1px dashed #cfd7cf; border-radius:10px; color:var(--ink); background:var(--paper); box-shadow:0 18px 60px rgba(15,25,18,.2); }
+  .memory-dialog::backdrop { background:rgba(26,34,28,.38); }
+  .dialog-head { position:sticky; top:0; z-index:2; display:flex; align-items:center; justify-content:space-between; padding:12px 16px; border-bottom:1px dashed #d9ded7; background:#f7f7f5; }
+  .dialog-body { padding:18px; }
+  .dialog-body h2 { margin:8px 0; font:500 24px/1.25 Iowan Old Style,Georgia,serif; overflow-wrap:anywhere; }
+  .dialog-text { color:#4e554e; font-size:12px; line-height:1.75; white-space:pre-wrap; overflow-wrap:anywhere; }
+  .meta { display:grid; grid-template-columns:100px minmax(0,1fr); gap:8px 12px; font-size:11px; line-height:1.5; }
+  .meta dt { color:#929890; }
+  .meta dd { margin:0; color:#4f564e; overflow-wrap:anywhere; }
+  @media(max-width:900px) { .layout{grid-template-columns:175px minmax(0,1fr)} main{padding:27px 22px 55px} .metric-grid{grid-template-columns:1fr} }
+  @media(max-width:560px) {
+    .topbar{height:58px;padding:0 14px}.layout{display:block;min-height:calc(100vh - 58px)}
+    .sidebar{position:sticky;top:58px;z-index:5;height:auto;padding:8px 11px;border-right:0;border-bottom:1px dashed #dfe2dc}
+    .side-label,.sidebar-note{display:none}.view-nav{display:flex;gap:3px;overflow-x:auto}.view-nav button{width:auto;min-width:max-content;padding:9px 10px;font-size:11px}
+    main{padding:22px 13px 42px}h1{font-size:26px}.row{grid-template-columns:1fr;gap:4px}.metric-grid{grid-template-columns:1fr}.filters input,.filters select{min-width:90px}
+    .card-foot .btn{margin-left:0}.dialog-body{padding:15px}
   }
 </style>
 </head>
 <body>
-<header class="topbar">
-  <div class="brand"><span class="mark" aria-hidden="true"></span><span>memstore</span></div>
-  <div class="top-right"><span class="pill" id="modePill">Local · read-only</span><span id="storePill">store</span></div>
-</header>
-<div class="layout" id="layout">
+<header class="topbar"><div class="brand"><span class="mark" aria-hidden="true"></span><span>memstore</span></div><div class="top-meta"><span class="pill">Local · read-only</span><span id="storePill">Loading store…</span></div></header>
+<div class="layout">
   <aside class="sidebar">
     <p class="side-label">Views</p>
     <nav class="view-nav" aria-label="Views">
-      <button class="active" data-view="library">Memory library</button>
-      <button data-view="agent">Agent view</button>
+      <button class="active" data-view="projects">Projects &amp; tasks</button>
+      <button data-view="agent">Agent retrieval</button>
+      <button data-view="library">Memory search</button>
       <button data-view="status">Store status</button>
-      <button data-view="handoff">Fresh-agent handoff</button>
     </nav>
-    <p class="sidebar-note">Read-only view of one local file. Nothing here writes a memory.</p>
+    <p class="sidebar-note">Every list comes from a command available to a memstore CLI caller. This page does not write memories.</p>
   </aside>
-  <main class="content">
-    <section id="page-library">
-      <div class="heading-row"><div><h1>Memory</h1><div class="subtitle">Stored memories, ranked by memstore itself.</div></div></div>
-      <div class="search-wrap"><span class="search-icon" aria-hidden="true">⌕</span>
-        <input class="search" id="q" type="search" placeholder="Search memories — words, not meaning" autocomplete="off" aria-label="Search memories">
-      </div>
-      <div class="filters">
-        <label>Kind<input id="fKind" placeholder="any"></label>
-        <label>Scope<input id="fScope" placeholder="any"></label>
-        <label>Status<select id="fStatus"><option value="">any</option><option>open</option><option>closed</option></select></label>
-        <label>Origin<input id="fOrigin" placeholder="any"></label>
-        <button class="btn" id="apply" type="button">Apply</button>
-        <button class="btn ghost" id="clear" type="button">Clear</button>
-      </div>
-      <p class="hint">Text uses BM25 over porter-stemmed terms, OR-joined. Fields are exact and combine with AND. A query sharing no stem returns nothing — there is no embedder here.</p>
-      <div class="results-label"><span id="count">—</span><span id="filterEcho"></span></div>
-      <div class="results" id="results" aria-live="polite"></div>
-      <div class="actions"><button class="btn ghost" id="more" type="button" hidden>Load more</button></div>
+  <main>
+    <section class="page" id="page-projects">
+      <h1>Projects &amp; tasks</h1>
+      <p class="subtitle">Recent records from memstore. This is stored context, not a separate project tracker.</p>
+      <div class="guide"><strong>What this view does:</strong> runs <code>recent -k N [SCOPE]</code>. Enter a scope such as <code>fs:skills</code> or leave it blank for all scopes. Records show their stored kind and status; no project health or completion is inferred.</div>
+      <div class="filters"><label>Scope<select id="projectScope"><option value="">All scopes</option></select></label><label>Recent records<select id="projectLimit"><option value="20" selected>20</option><option value="50">50</option><option value="100">100</option></select></label><button class="btn" id="loadProject" type="button">Load recent</button></div>
+      <p class="hint">Status counts describe only these recent records. Scope choices come from loaded Recent results; they are not a complete scope catalogue.</p>
+      <div class="summary" id="projectSummary"></div>
+      <div class="kind-legend" id="projectKindLegend" aria-label="Memory kind colors"></div>
+      <div class="results-label"><span id="projectCount">—</span><span id="projectCaption"></span></div>
+      <div class="cards" id="projectResults" aria-live="polite"></div>
     </section>
 
-    <section id="page-agent" hidden>
-      <h1>Agent view</h1>
-      <p class="subtitle">Exactly what memstore returns for the current query. This is not a record of what any agent received.</p>
-      <div class="panel" style="margin-top:20px">
-        <div class="metric-label">Returned text · rough estimate</div>
-        <div class="results-label" style="margin:6px 0 0"><span id="tokenEstimate">—</span><span id="charEstimate">—</span></div>
-        <p class="hint" style="margin:8px 0 0">Estimate is bytes of returned text ÷ 4. No tokenizer is used. Prompt inclusion, context-window use and provider cache are not measured and cannot be shown.</p>
-      </div>
-      <div class="rows" style="margin-top:18px">
-        <div class="row"><strong>Search available</strong><span>Lexical only: this server configures no embedder.</span></div>
-        <div class="row"><strong>Retrieved by agent</strong><span>Unknown — no agent reports retrievals to this store.</span></div>
-        <div class="row"><strong>Prompt / context / cache</strong><span>Unknown — no provider integration exists.</span></div>
-      </div>
-      <h3 class="side-label" style="margin:22px 0 10px">Candidates for the current query</h3>
-      <div class="results" id="agentResults"></div>
+    <section class="page" id="page-agent" hidden>
+      <h1>Agent retrieval</h1>
+      <p class="subtitle">Run the same <code>search -k N QUERY</code> call an agent can make. Results and order come from memstore.</p>
+      <div class="guide"><strong>Check what memstore returns:</strong> enter the words a fresh agent might search for, then run the search. Read the returned memories and their rank. If important context is missing, memstore may have no shared words to match. This does not show the agent’s full prompt or prove it ran this query.</div>
+      <div class="searchbox"><span class="search-icon" aria-hidden="true">⌕</span><input class="search" id="agentQuery" placeholder="What would the agent search for?" aria-label="Agent search query"></div>
+      <div class="picker-row"><label>Start from a recent memory<select id="agentMemoryPick"><option value="">Choose a record from loaded recent results…</option></select></label><button class="btn ghost" id="useAgentMemory" type="button">Use as search query</button></div>
+      <div class="picked-record" id="pickedMemoryPreview" hidden></div>
+      <div class="filters"><label>Maximum results<select id="agentLimit"><option>5</option><option selected>10</option><option>20</option><option>50</option><option>100</option></select></label><button class="btn" id="runAgentSearch" type="button">Run memstore search</button><span id="agentEstimate" class="hint" style="margin:0"></span></div>
+      <div class="kind-legend" id="agentKindLegend" aria-label="Memory kind colors"></div>
+      <div class="cards" id="agentResults"></div>
+      <div class="row-list" style="margin-top:18px"><div class="row"><strong>Actual prompt / context</strong><span>Unknown. Memstore does not expose an agent session or provider cache.</span></div><div class="row"><strong>This view confirms</strong><span>Only these exact results from this exact memstore search, at the time it ran.</span></div></div>
     </section>
 
-    <section id="page-status" hidden>
+    <section class="page" id="page-library" hidden>
+      <h1>Memory search</h1>
+      <p class="subtitle">Run the existing memstore <code>search</code> command through the local page.</p>
+      <div class="guide"><strong>Search tips:</strong> use distinctive words likely to occur in the stored text. Terms are stemmed and OR-joined. Search is not semantic: zero shared stems returns no results. Use <code>get ID</code> via Read full memory to inspect one result.</div>
+      <div class="picker-row"><label>Pick a recent memory to read<select id="libraryMemoryPick"><option value="">Choose a record from loaded Recent results…</option></select></label></div>
+      <div class="hint">This picker contains only records in the last loaded Recent result set.</div>
+      <div class="searchbox"><span class="search-icon" aria-hidden="true">⌕</span><input class="search" id="libraryQuery" placeholder="Or search by words" aria-label="Memory search query"></div>
+      <div class="filters"><label>Maximum results<select id="libraryLimit"><option>5</option><option selected>10</option><option>20</option><option>50</option><option>100</option></select></label><button class="btn" id="runLibrarySearch" type="button">Search</button></div>
+      <div class="kind-legend" id="libraryKindLegend" aria-label="Memory kind colors"></div>
+      <div class="cards" id="libraryResults"></div>
+    </section>
+
+    <section class="page" id="page-status" hidden>
       <h1>Store status</h1>
-      <p class="subtitle">Measured by <code>Store.Stats()</code> when this page loaded.</p>
-      <div class="grid3">
-        <div class="panel"><div class="metric-label">Memories</div><div class="metric-value" id="statTotal">—</div><div class="metric-note" id="statLive">—</div></div>
-        <div class="panel"><div class="metric-label">File</div><div class="metric-value" id="statBytes">—</div><div class="metric-note" id="statWal">—</div></div>
-        <div class="panel"><div class="metric-label">Newest</div><div class="metric-value" id="statNewest">—</div><div class="metric-note" id="statOldest">—</div></div>
-      </div>
-      <div class="rows">
-        <div class="row"><strong>Live rows</strong><span id="statLiveNote">Live means not forgotten. The status column is a separate lifecycle value.</span></div>
-        <div class="row"><strong>Search</strong><span>Lexical: FTS5 bm25 over a porter-stemmed index, OR-joined.</span></div>
-        <div class="row"><strong>Embedder</strong><span id="statEmbedder">—</span></div>
-        <div class="row"><strong>Forgetting</strong><span>One-way. A forgotten memory hides from every read and its bytes stay in the file.</span></div>
-        <div class="row"><strong>Writes from this page</strong><span>None. The server exposes no write route.</span></div>
-        <div class="row"><strong>Not reported</strong><span>Schema version, task progress and agent ordering: the store exposes no such value, so this page shows none.</span></div>
-      </div>
-    </section>
-
-    <section id="page-handoff" hidden>
-      <h1>Fresh-agent handoff</h1>
-      <p class="subtitle">A packet for an agent with no conversation history. Source memories come from the store; every other field is yours to verify.</p>
-      <div class="banner" style="margin-top:18px"><strong>Nothing here is saved.</strong> The draft lives in this browser tab and is lost on reload. Copy or download is the only way it leaves.</div>
-      <div style="margin-top:18px">
-        <div class="field"><label for="hGoal">Goal</label><input id="hGoal" placeholder="One line: what the next agent must achieve"></div>
-        <div class="two">
-          <div class="field"><label for="hRepo">Repository</label><input id="hRepo" placeholder="Path or URL"></div>
-          <div class="field"><label for="hRev">Branch / commit</label><input id="hRev" placeholder="Unverified until you check"></div>
-        </div>
-        <div class="field"><label for="hWorktree">Working-tree state</label><textarea id="hWorktree" placeholder="Paste verified git status. Do not assume clean."></textarea></div>
-        <div class="two">
-          <div class="field"><label for="hDone">Done / current state</label><textarea id="hDone" placeholder="Verified vs planned"></textarea></div>
-          <div class="field"><label for="hNext">Next action</label><textarea id="hNext" placeholder="One concrete action"></textarea></div>
-        </div>
-        <div class="field"><label for="hConstraints">Decisions and constraints</label><textarea id="hConstraints" placeholder="Frozen decisions, locked contracts, limits"></textarea></div>
-        <div class="two">
-          <div class="field"><label for="hEvidence">Evidence / tests</label><textarea id="hEvidence" placeholder="Commands and outcomes you actually ran"></textarea></div>
-          <div class="field"><label for="hOpen">Open questions / risks</label><textarea id="hOpen" placeholder="What remains unknown"></textarea></div>
-        </div>
-        <div class="field">
-          <label for="sourceQ">Source memories</label>
-          <div class="filters" style="margin-bottom:8px">
-            <input class="search" id="sourceQ" style="padding-left:12px;height:32px" placeholder="Find memories to include">
-            <button class="btn" id="sourceSearch" type="button">Find</button>
-          </div>
-          <div class="sources" id="sourceList"><div class="empty">Search for memories to include. Only exact stored text is included.</div></div>
-        </div>
-      </div>
-      <h3 class="side-label" style="margin:18px 0 8px">Fresh-agent readiness check</h3>
-      <p class="hint" style="margin:0">A completeness aid you apply. It cannot prove another agent will understand or succeed.</p>
-      <div class="checks">
-        <label><input type="checkbox" data-check> Goal is actionable</label>
-        <label><input type="checkbox" data-check> Verified vs unverified is explicit</label>
-        <label><input type="checkbox" data-check> Constraints are stated</label>
-        <label><input type="checkbox" data-check> Next action is concrete</label>
-        <label><input type="checkbox" data-check> Risks are visible</label>
-        <label><input type="checkbox" data-check> Sources are identified</label>
-      </div>
-      <div class="results-label" style="margin-top:10px"><span id="checkScore">0 of 6</span><span id="sourceCount">0 sources</span></div>
-      <div class="actions"><button class="btn" id="copyPacket" type="button">Copy packet</button><button class="btn ghost" id="downloadPacket" type="button">Download Markdown</button></div>
-      <div class="preview" id="packet" aria-label="Handoff preview"></div>
-      <h3 class="side-label" style="margin:24px 0 8px">Dry run · optional</h3>
-      <p class="hint" style="margin:0 0 8px">Copy the prompt into a genuinely new conversation, paste the answer below, and compare it with the packet. The answer stays here and is never exported.</p>
-      <div class="actions"><button class="btn ghost" id="copyPrompt" type="button">Copy dry-run prompt</button></div>
-      <div class="field" style="margin-top:12px"><label for="dryAnswer">Fresh agent answer</label><textarea id="dryAnswer" placeholder="Paste the fresh agent's summary"></textarea></div>
-      <div class="field"><label for="dryNotes">Your review notes</label><textarea id="dryNotes" placeholder="What did it invent, miss, or misread?"></textarea></div>
+      <p class="subtitle">Live facts from <code>stats</code> and the store’s known retrieval limits.</p>
+      <div class="metric-grid"><div class="metric"><div class="metric-label">All stored</div><div class="metric-value" id="statTotal">—</div><div class="metric-note" id="statLive">—</div></div><div class="metric"><div class="metric-label">Database file</div><div class="metric-value" id="statBytes">—</div><div class="metric-note" id="statWal">—</div></div><div class="metric"><div class="metric-label">Newest record</div><div class="metric-value" id="statNewest">—</div><div class="metric-note" id="statOldest">—</div></div></div>
+      <div class="row-list"><div class="row"><strong>Search</strong><span>BM25 over porter-stemmed terms, OR-joined. No shared stem can mean no result.</span></div><div class="row"><strong>Agent context</strong><span>Not exposed. Agent retrieval, prompt composition, context-window use and provider cache are unknown.</span></div><div class="row"><strong>Projects/tasks</strong><span>Only stored records, scopes, kinds and status labels. No project health score is computed.</span></div><div class="row"><strong>Forgetting</strong><span>Forgotten records are hidden from reads; their bytes remain. No CLI restore command exists.</span></div></div>
     </section>
   </main>
-  <aside class="detail" id="detail" aria-label="Selected memory"><div class="detail-empty">Select a memory<br>to read its detail.</div></aside>
 </div>
+<dialog class="memory-dialog" id="memoryDialog" aria-labelledby="dialogTitle"><div class="dialog-head"><span class="kind">Memory detail · get ID</span><button class="btn ghost" id="closeDialog" type="button">Close</button></div><div class="dialog-body" id="dialogBody"></div></dialog>
 <script>
 const $ = id => document.getElementById(id);
-const state = { q: "", filter: { kind: "", scope: "", status: "", origin: "" }, offset: 0, results: [], hasMore: false, selected: null, sources: new Map() };
-
-const escapeHTML = value => String(value ?? "").replace(/[&<>"']/g, ch => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[ch]));
-const fmtDate = value => value ? new Intl.DateTimeFormat("en", { month: "short", day: "numeric", year: "numeric" }).format(new Date(value)) : "—";
-const fmtBytes = n => n >= 1 << 20 ? (n / (1 << 20)).toFixed(1) + " MB" : n >= 1 << 10 ? (n / (1 << 10)).toFixed(1) + " kB" : n + " B";
-const label = value => value ? value.charAt(0).toUpperCase() + value.slice(1) : "—";
-const preview = text => (text || "").split("\n")[0];
-const shorten = (text, max) => { const line = text || ""; return line.length > max ? line.slice(0, max - 1).replace(/\s+\S*$/, "") + "…" : line; };
-const headline = m => m.Title || shorten(preview(m.Text), 72);
-
-async function api(path) {
-  const res = await fetch(path, { headers: { accept: "application/json" } });
-  if (!res.ok) throw new Error((await res.text()).trim() || res.status + " " + res.statusText);
-  return res.json();
-}
-
-function params(extra) {
-  const p = new URLSearchParams();
-  if (state.q) p.set("q", state.q);
-  for (const [key, value] of Object.entries(state.filter)) if (value) p.set(key, value);
-  for (const [key, value] of Object.entries(extra || {})) p.set(key, value);
-  return p.toString();
-}
-
-async function runSearch(append) {
-  const offset = append ? state.results.length : 0;
-  try {
-    const data = await api("/api/memories?" + params({ limit: 20, offset }));
-    state.results = append ? state.results.concat(data.memories) : data.memories;
-    state.hasMore = data.hasMore;
-    state.offset = offset;
-    renderResults();
-    renderAgent();
-  } catch (err) {
-    $("results").innerHTML = `<div class="empty">${escapeHTML(err.message)}</div>`;
-    $("count").textContent = "—";
-  }
-}
-
-function renderResults() {
-  const rows = state.results;
-  $("count").textContent = rows.length ? rows.length + (state.hasMore ? "+" : "") + (rows.length === 1 ? " memory" : " memories") : "no matches";
-  $("filterEcho").textContent = Object.entries(state.filter).filter(([, v]) => v).map(([k, v]) => k + ":" + v).join(" · ") || "all memories";
-  $("more").hidden = !state.hasMore;
-  $("results").innerHTML = rows.length ? rows.map(m => `
-    <article class="card${m.Id === state.selected ? " selected" : ""}" data-id="${m.Id}" tabindex="0">
-      <div class="card-top"><span class="kind">${escapeHTML(label(m.Kind))}</span><span class="date">${fmtDate(m.Ts)}</span></div>
-      ${m.Title ? `<h2>${escapeHTML(m.Title)}</h2>` : ""}
-      <p class="excerpt">${escapeHTML(preview(m.Text))}</p>
-      <div class="card-bottom"><span>${escapeHTML(m.Scope || "no scope")}</span><span>·</span><span>${escapeHTML(m.Status)}</span><span>·</span><span>${escapeHTML(m.Origin)}</span></div>
-    </article>`).join("") : `<div class="empty">No memory matches. A lexical search returns nothing when the words share no stem.</div>`;
-  $("results").querySelectorAll(".card").forEach(card => {
-    const open = () => openMemory(Number(card.dataset.id));
-    card.addEventListener("click", open);
-    card.addEventListener("keydown", e => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); open(); } });
-  });
-}
-
-function renderAgent() {
-  const chars = state.results.reduce((sum, m) => sum + (m.Text || "").length, 0);
-  $("tokenEstimate").textContent = "~" + Math.ceil(chars / 4) + " tokens";
-  $("charEstimate").textContent = chars.toLocaleString() + " characters";
-  $("agentResults").innerHTML = state.results.map((m, i) => `
-    <div class="card"><div class="card-top"><span class="kind">${i + 1} · ${escapeHTML(label(m.Kind))}</span><span class="date">${escapeHTML(m.Scope || "no scope")}</span></div>
-    ${m.Title ? `<h2>${escapeHTML(m.Title)}</h2>` : `<p class="excerpt">${escapeHTML(shorten(preview(m.Text), 120))}</p>`}<div class="card-bottom"><span>memory ${m.Id}</span><span>·</span><span>${escapeHTML(m.Status)}</span></div></div>`).join("") || `<div class="empty">No candidates for the current query.</div>`;
-}
-
-async function openMemory(id) {
-  state.selected = id;
-  renderResults();
-  if (matchMedia("(max-width: 820px)").matches) $("detail").classList.add("open");
-  try {
-    const data = await api("/api/memories/" + id);
-    const m = data.memory;
-    const meta = [["Kind", m.Kind], ["Scope", m.Scope], ["Status", m.Status], ["Origin", m.Origin], ["Origin id", m.OriginId], ["Ref", m.Ref], ["FS node", m.FsNode], ["Tier", m.Tier], ["Memory id", m.Id]].filter(([, v]) => v !== "" && v !== undefined && v !== null);
-    const relations = data.relations.length ? data.relations.map(r => `
-      <div class="link-item${r.available ? "" : " unavailable"}" ${r.available ? `data-rel="${r.to}" tabindex="0"` : ""}>
-        <span>↗</span><span>${escapeHTML(r.rel)} · ${r.available ? escapeHTML(r.title || "memory " + r.to) : "memory " + r.to + " · unavailable"} ${r.available ? `<span style="color:#a1a69e">· ${r.to}</span>` : ""}</span>
-      </div>`).join("") : `<div class="hint" style="margin:0">No stored relations.</div>`;
-    $("detail").innerHTML = `
-      <button class="btn ghost" id="back" type="button" style="margin-bottom:16px">← Back</button>
-      <div class="detail-kicker">${escapeHTML(label(m.Kind))}</div>
-      <h2>${escapeHTML(m.Title || shorten(preview(m.Text), 90))}</h2>
-      <div class="detail-time">${fmtDate(m.Ts)} · ${escapeHTML(m.Status)}</div>
-      <div class="detail-body">${escapeHTML(m.Text)}</div>
-      ${m.Extra ? `<div class="section"><h3>Extra</h3><div class="detail-body">${escapeHTML(m.Extra)}</div></div>` : ""}
-      <div class="section"><h3>Stored fields</h3>${meta.map(([k, v]) => `<div class="meta-row"><span class="meta-label">${escapeHTML(k)}</span><span class="meta-value">${escapeHTML(String(v))}</span></div>`).join("")}</div>
-      <div class="section"><h3>Relations</h3>${relations}</div>`;
-    $("back").addEventListener("click", () => { $("detail").classList.remove("open"); state.selected = null; renderResults(); });
-    $("detail").querySelectorAll("[data-rel]").forEach(el => el.addEventListener("click", () => openMemory(Number(el.dataset.rel))));
-  } catch (err) {
-    $("detail").innerHTML = `<div class="empty">${escapeHTML(err.message)}</div>`;
-  }
-}
-
-async function loadStats() {
-  try {
-    const data = await api("/api/stats");
-    const st = data.store;
-    $("statTotal").textContent = st.Total.toLocaleString();
-    $("statLive").textContent = st.Open.toLocaleString() + " live · " + st.Forgotten.toLocaleString() + " forgotten";
-    $("statBytes").textContent = fmtBytes(st.Bytes);
-    $("statWal").textContent = st.WalBytes ? "WAL " + fmtBytes(st.WalBytes) : "no WAL segments";
-    $("statNewest").textContent = fmtDate(st.Newest);
-    $("statOldest").textContent = st.Oldest ? "oldest " + fmtDate(st.Oldest) : "empty store";
-    $("statEmbedder").textContent = data.embedder ? "configured" : "none — search is lexical only";
-    $("storePill").textContent = st.Total.toLocaleString() + " memories";
-  } catch (err) {
-    $("storePill").textContent = "store unreadable";
-  }
-}
-
-async function findSources() {
-  const q = $("sourceQ").value.trim();
-  const p = new URLSearchParams({ limit: 20 });
-  if (q) p.set("q", q);
-  try {
-    const data = await api("/api/memories?" + p.toString());
-    $("sourceList").innerHTML = data.memories.length ? data.memories.map(m => `
-      <label class="source"><input type="checkbox" data-source="${m.Id}" ${state.sources.has(m.Id) ? "checked" : ""}>
-      <span>${escapeHTML(headline(m))}<small>memory ${m.Id} · ${escapeHTML(m.Scope || "no scope")} · ${escapeHTML(m.Kind)} · ${fmtDate(m.Ts)}</small></span></label>`).join("")
-      : `<div class="empty">No memory matches that search.</div>`;
-    data.memories.forEach(m => state.sources.set(m.Id, m));
-    $("sourceList").querySelectorAll("[data-source]").forEach(box => box.addEventListener("change", () => {
-      if (!box.checked) state.sources.delete(Number(box.dataset.source));
-      renderPacket();
-    }));
-    renderPacket();
-  } catch (err) {
-    $("sourceList").innerHTML = `<div class="empty">${escapeHTML(err.message)}</div>`;
-  }
-}
-
-const fieldValue = id => $(id).value.trim();
-function selectedSources() {
-  return [...$("sourceList").querySelectorAll("[data-source]:checked")].map(box => state.sources.get(Number(box.dataset.source))).filter(Boolean);
-}
-
-function packetMarkdown() {
-  const unverified = "Not verified / not provided";
-  const sources = selectedSources();
-  const sourceText = sources.length ? sources.map(m => `- **${headline(m)}** (memory ${m.Id}; scope: ${m.Scope || "none"}; kind: ${m.Kind}; origin: ${m.Origin}; ${fmtDate(m.Ts)})\n  ${(m.Text || "").replace(/\n/g, " ")}`).join("\n") : "- No source memories selected.";
-  return `# Agent handoff\n\n> Carries no conversation history. Verify every current-state claim against the checkout before editing.\n\n## Goal\n${fieldValue("hGoal") || "[Not provided]"}\n\n## Repository and checkout\n- Repository: ${fieldValue("hRepo") || "[Not provided]"}\n- Branch / commit: ${fieldValue("hRev") || unverified}\n- Working tree: ${fieldValue("hWorktree") || unverified}\n\n## Done / current state\n${fieldValue("hDone") || "[Not provided]"}\n\n## Decisions and constraints\n${fieldValue("hConstraints") || "[Not provided]"}\n\n## Source memories\n${sourceText}\n\n## Evidence / tests\n${fieldValue("hEvidence") || "Not provided; do not assume tests passed."}\n\n## Open questions and risks\n${fieldValue("hOpen") || "None recorded."}\n\n## Next action\n${fieldValue("hNext") || "[Not provided]"}\n\n## Instructions for the fresh agent\n1. Treat this packet as the full conversation context; do not assume earlier chat exists.\n2. Verify repository, branch, working tree and test claims before editing.\n3. Read the cited source memories and the relevant locked project docs.\n4. Preserve the constraints; report contradictions or missing evidence before proceeding.\n5. Start with the stated next action, and ask if a material decision is unresolved.\n\n## Note\nSource memories are stored context, not proof of current code state and not proof that any previous agent saw them.`;
-}
-
-function renderPacket() {
-  $("packet").textContent = packetMarkdown();
-  $("checkScore").textContent = $("page-handoff").querySelectorAll("[data-check]:checked").length + " of 6";
-  $("sourceCount").textContent = selectedSources().length + (selectedSources().length === 1 ? " source" : " sources");
-}
-
-async function copyText(text, button, done) {
-  try {
-    await navigator.clipboard.writeText(text);
-    const before = button.textContent;
-    button.textContent = done;
-    setTimeout(() => { button.textContent = before; }, 1500);
-  } catch {
-    button.textContent = "Clipboard unavailable";
-  }
-}
-
-document.querySelectorAll(".view-nav button").forEach(button => button.addEventListener("click", () => {
-  const view = button.dataset.view;
-  document.querySelectorAll(".view-nav button").forEach(b => b.classList.toggle("active", b === button));
-  $("layout").classList.toggle("wide", view !== "library");
-  for (const name of ["library", "agent", "status", "handoff"]) $("page-" + name).hidden = name !== view;
-  window.scrollTo(0, 0);
-  if (view === "status") loadStats();
-  if (view === "agent") renderAgent();
-  if (view === "handoff") renderPacket();
-}));
-
-let typing;
-$("q").addEventListener("input", () => {
-  clearTimeout(typing);
-  typing = setTimeout(() => { state.q = $("q").value.trim(); runSearch(false); }, 220);
-});
-$("apply").addEventListener("click", () => {
-  state.filter = { kind: $("fKind").value.trim(), scope: $("fScope").value.trim(), status: $("fStatus").value, origin: $("fOrigin").value.trim() };
-  runSearch(false);
-});
-$("clear").addEventListener("click", () => {
-  $("q").value = ""; $("fKind").value = ""; $("fScope").value = ""; $("fStatus").value = ""; $("fOrigin").value = "";
-  state.q = ""; state.filter = { kind: "", scope: "", status: "", origin: "" };
-  runSearch(false);
-});
-$("more").addEventListener("click", () => runSearch(true));
-
-$("sourceSearch").addEventListener("click", findSources);
-$("sourceQ").addEventListener("keydown", e => { if (e.key === "Enter") { e.preventDefault(); findSources(); } });
-$("page-handoff").addEventListener("input", renderPacket);
-$("page-handoff").addEventListener("change", renderPacket);
-$("copyPacket").addEventListener("click", e => copyText(packetMarkdown(), e.currentTarget, "Copied"));
-$("downloadPacket").addEventListener("click", () => {
-  const blob = new Blob([packetMarkdown()], { type: "text/markdown;charset=utf-8" });
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement("a");
-  a.href = url; a.download = "memstore-handoff.md"; a.click();
-  URL.revokeObjectURL(url);
-});
-$("copyPrompt").addEventListener("click", e => copyText(
-  `Using only the handoff packet below and the named checkout, assume no prior conversation. Do not edit files. Report: (1) the goal, (2) what is verified versus unverified, (3) the constraints, (4) the next action, (5) any contradiction or missing information. If a claim cannot be checked, say so.\n\n${packetMarkdown()}`,
-  e.currentTarget, "Copied prompt"));
-
-document.addEventListener("keydown", e => {
-  if (e.key === "/" && !["INPUT", "TEXTAREA", "SELECT"].includes(document.activeElement.tagName)) { e.preventDefault(); $("q").focus(); }
-});
-
-runSearch(false);
-loadStats();
+const state = { recentRows: [], scopeChoices: new Set() };
+const esc = v => String(v ?? "").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+const date = v => v ? new Intl.DateTimeFormat("en",{month:"short",day:"numeric",year:"numeric"}).format(new Date(v)) : "—";
+const bytes = n => n >= 1048576 ? (n/1048576).toFixed(1)+" MB" : n >= 1024 ? (n/1024).toFixed(1)+" kB" : n+" B";
+const firstLine = s => (s || "").split("\n")[0];
+const title = m => m.Title || firstLine(m.Text).slice(0,100) || `Memory ${m.Id}`;
+async function api(path) { const r=await fetch(path,{headers:{accept:"application/json"}}); if(!r.ok) throw new Error((await r.text()).trim() || `${r.status}`); return r.json(); }
+function kindHue(kind) { let h=0; for(const c of String(kind||"memory")) h=(h*31+c.charCodeAt(0))%360; return h; }
+function kindBadge(kind,labelText=kind) { return `<span class="kind" style="--kind-hue:${kindHue(kind)}">${esc(labelText || "memory")}</span>`; }
+function card(m,rank="") { return `<article class="card"><div class="card-head">${kindBadge(m.Kind,rank?`${rank} · ${m.Kind}`:m.Kind)}<span>${date(m.Ts)}</span></div><h2>${esc(title(m))}</h2><p class="excerpt">${esc(m.Text)}</p><div class="card-foot"><span>${esc(m.Scope || "no scope")}</span><span>·</span><span>status: ${esc(m.Status)}</span><span>·</span><span>${esc(m.Origin)}</span><button class="btn ghost" data-get="${m.Id}" type="button">Read full memory · ${m.Id}</button></div></article>`; }
+function bindGet(root) { root.querySelectorAll("[data-get]").forEach(b=>b.addEventListener("click",()=>loadMemory(Number(b.dataset.get)))); }
+async function loadMemory(id) { try { const m=await api(`/api/get?id=${id}`); $("dialogBody").innerHTML=`<h2 id="dialogTitle">${esc(title(m))}</h2><p class="hint">Memory ${m.Id} · ${esc(m.Scope || "no scope")} · ${esc(m.Kind)} · status: ${esc(m.Status)} · ${date(m.Ts)}</p><div class="dialog-text">${esc(m.Text)}</div>${m.Extra?`<div class="section"><h3>Extra stored by memstore</h3><div class="dialog-text">${esc(m.Extra)}</div></div>`:""}<div class="section"><h3>Stored fields</h3><dl class="meta">${[["kind",m.Kind],["scope",m.Scope],["status",m.Status],["origin",m.Origin],["origin_id",m.OriginId],["ref",m.Ref],["fs_node",m.FsNode],["supersedes",m.Supersedes],["found_by",m.FoundBy],["id",m.Id]].filter(([,v])=>v!==""&&v!==null&&v!==undefined).map(([k,v])=>`<dt>${esc(k)}</dt><dd>${esc(v)}</dd>`).join("")}</dl></div><p class="hint">This is <code>get ${m.Id}</code>: the stored memory itself.</p>`; $("memoryDialog").showModal(); } catch(e) { $("dialogBody").textContent=e.message; $("memoryDialog").showModal(); } }
+function fillSelect(id,values,placeholder) { const el=$(id),current=el.value,list=[...values].sort(); el.innerHTML=`<option value="">${esc(placeholder)}</option>`+list.map(v=>`<option value="${esc(v)}">${esc(v)}</option>`).join(""); if(list.includes(current))el.value=current; }
+function fillRecordPicker(id,rows,placeholder) { const el=$(id),current=el.value; el.innerHTML=`<option value="">${esc(placeholder)}</option>`+rows.map(m=>`<option value="${m.Id}">${esc(m.Kind)} · ${esc(m.Scope||"no scope")} · ${esc(title(m))}</option>`).join(""); if(rows.some(m=>String(m.Id)===current))el.value=current; }
+function paintLegend(id,rows) { const kinds=[...new Set(rows.map(m=>m.Kind).filter(Boolean))].sort(); $(id).innerHTML=kinds.map(k=>kindBadge(k)).join(""); }
+async function loadRecent() { const scope=$("projectScope").value.trim(), k=$("projectLimit").value, p=new URLSearchParams({k}); if(scope)p.set("scope",scope); $("projectResults").innerHTML=`<div class="empty">Loading recent records…</div>`; try { const rows=await api("/api/recent?"+p); state.recentRows=rows; for(const m of rows)if(m.Scope)state.scopeChoices.add(m.Scope); if(scope)state.scopeChoices.add(scope); fillSelect("projectScope",state.scopeChoices,"All scopes"); fillRecordPicker("agentMemoryPick",rows,"Choose a record from loaded Recent results…"); fillRecordPicker("libraryMemoryPick",rows,"Choose a record from loaded Recent results…"); $("projectResults").innerHTML=rows.length?rows.map(m=>card(m)).join(""):`<div class="empty">No recent memories for this scope.</div>`; $("projectCount").textContent=`${rows.length} returned by recent -k ${k}${scope?` ${scope}`:""}`; $("projectCaption").textContent=scope?`scope: ${scope}`:"all scopes"; const counts={}; for(const m of rows){counts[m.Status]=(counts[m.Status]||0)+1;} $("projectSummary").innerHTML=Object.entries(counts).map(([k,n])=>`<span>status ${esc(k)} · ${n}</span>`).join("") || ""; paintLegend("projectKindLegend",rows); bindGet($("projectResults")); } catch(e) { $("projectResults").innerHTML=`<div class="empty">${esc(e.message)}</div>`; } }
+async function runSearch(queryID,limitID,resultID,emptyText) { const q=$(queryID).value.trim(), k=$(limitID).value; if(!q){$(resultID).innerHTML=`<div class="empty">Enter a query. This calls the existing memstore search operation.</div>`;return;} $(resultID).innerHTML=`<div class="empty">Running memstore search…</div>`; try { const rows=await api("/api/search?"+new URLSearchParams({q,k})); $(resultID).innerHTML=rows.length?rows.map((m,i)=>card(m,String(i+1))).join(""):`<div class="empty">${esc(emptyText)}</div>`; bindGet($(resultID)); const legendID=resultID==="agentResults"?"agentKindLegend":"libraryKindLegend"; paintLegend(legendID,rows); if(resultID==="agentResults"){const chars=rows.reduce((n,m)=>n+(m.Text||"").length,0);$("agentEstimate").textContent=`${rows.length} returned · about ${Math.ceil(chars/4)} text tokens (rough text-only estimate)`;} } catch(e){$(resultID).innerHTML=`<div class="empty">${esc(e.message)}</div>`;} }
+function fillRecordPicker(id,rows,placeholder) { const el=$(id),current=el.value; el.innerHTML=`<option value="">${esc(placeholder)}</option>`+rows.map(m=>`<option value="${m.Id}">${esc(m.Kind)} · ${esc(m.Scope||"no scope")} · ${esc(title(m))}</option>`).join(""); if(rows.some(m=>String(m.Id)===current))el.value=current; }
+function pickedMemory(id) { return (state.recentRows||[]).find(m=>m.Id===Number(id)); }
+function showPickedMemory(memory) { const box=$("pickedMemoryPreview"); if(!memory){box.hidden=true;box.innerHTML="";return;} box.hidden=false; box.innerHTML=`<strong>${kindBadge(memory.Kind)} ${esc(title(memory))}</strong><p>${esc(memory.Scope||"no scope")} · status: ${esc(memory.Status)} · memory ${memory.Id}</p><p>${esc(firstLine(memory.Text))}</p>`; }
+function usePickedAsQuery() { const memory=pickedMemory($("agentMemoryPick").value); if(!memory)return; const query=title(memory); $("agentQuery").value=query; showPickedMemory(memory); runSearch("agentQuery","agentLimit","agentResults","No matches."); }
+async function loadStats() { try { const s=await api("/api/stats"); $("statTotal").textContent=s.Total.toLocaleString(); $("statLive").textContent=`${s.Open.toLocaleString()} live · ${s.Forgotten.toLocaleString()} forgotten`; $("statBytes").textContent=bytes(s.Bytes); $("statWal").textContent=s.WalBytes?`WAL ${bytes(s.WalBytes)}`:"no WAL segments"; $("statNewest").textContent=date(s.Newest); $("statOldest").textContent=s.Oldest?`oldest ${date(s.Oldest)}`:"empty store"; $("storePill").textContent=`${s.Total.toLocaleString()} memories`; } catch { $("storePill").textContent="store unreadable"; } }
+document.querySelectorAll("[data-view]").forEach(b=>b.addEventListener("click",()=>{document.querySelectorAll("[data-view]").forEach(x=>x.classList.toggle("active",x===b));document.querySelectorAll(".page").forEach(x=>x.hidden=x.id!==`page-${b.dataset.view}`);window.scrollTo(0,0);if(b.dataset.view==="projects")loadRecent();if(b.dataset.view==="status")loadStats();}));
+$("loadProject").addEventListener("click",loadRecent); $("projectScope").addEventListener("change",loadRecent);
+$("projectLimit").addEventListener("change",loadRecent);
+$("runAgentSearch").addEventListener("click",()=>runSearch("agentQuery","agentLimit","agentResults","No matches. Without an embedder, search needs at least one shared stem.")); $("agentQuery").addEventListener("keydown",e=>{if(e.key==="Enter")runSearch("agentQuery","agentLimit","agentResults","No matches.");});
+$("agentMemoryPick").addEventListener("change",()=>showPickedMemory(pickedMemory($("agentMemoryPick").value))); $("useAgentMemory").addEventListener("click",usePickedAsQuery);
+$("libraryMemoryPick").addEventListener("change",()=>{const m=pickedMemory($("libraryMemoryPick").value);if(m)loadMemory(m.Id);});
+$("runLibrarySearch").addEventListener("click",()=>runSearch("libraryQuery","libraryLimit","libraryResults","No matches. Search is lexical; zero shared stems returns nothing.")); $("libraryQuery").addEventListener("keydown",e=>{if(e.key==="Enter")runSearch("libraryQuery","libraryLimit","libraryResults","No matches.");});
+$("closeDialog").addEventListener("click",()=>$("memoryDialog").close()); $("memoryDialog").addEventListener("click",e=>{if(e.target===$("memoryDialog"))$("memoryDialog").close();});
+document.addEventListener("keydown",e=>{if(e.key==="/"&&!['INPUT','SELECT'].includes(document.activeElement.tagName)){e.preventDefault();$("agentQuery").focus();}});
+loadRecent(); loadStats();
 </script>
 </body>
 </html>

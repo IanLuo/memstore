@@ -38,95 +38,48 @@ type Matchers struct {
 // embed, lexical still answers, with fewer results. Soft-deleted rows are
 // excluded from both matchers. No match is an empty result, not an error.
 func (m *Matchers) Search(q string, k int) ([]Memory, error) {
-	out, _, err := m.searchPage(q, Filter{}, k, 0)
-	return out, err
-}
-
-// searchPage is Search with the exact filters and one page of a larger result
-// set. The filters reach the rankers themselves, so a matching row competes
-// only against rows that also match: filtering after the limit would drop a
-// valid hit that ranked below an unfiltered page boundary. One extra id answers
-// hasMore without a second query. offset walks the fused order.
-func (m *Matchers) searchPage(q string, f Filter, limit, offset int) ([]Memory, bool, error) {
-	if limit <= 0 {
-		return nil, false, nil
+	if k <= 0 {
+		return nil, nil
 	}
-	want := limit + offset + 1
 	match := ftsQuery(q)
 	var lex []int64
 	if match != "" {
 		var err error
-		lex, err = m.lexical(match, f, want)
+		lex, err = m.lexical(match, k)
 		if err != nil {
-			return nil, false, err
+			return nil, err
 		}
 	}
 	var vec []int64
 	if m.embedder != nil {
 		// Fail-open on read: a query the embedder will not take yields the
 		// lexical results, never an error.
-		vec, _ = m.vector(q, f, want)
+		vec, _ = m.vector(q, k)
 	}
-	ids := fuse(lex, vec, want)
-	hasMore := len(ids) > limit+offset
-	if offset >= len(ids) {
-		ids = nil
-	} else {
-		ids = ids[offset:]
-	}
-	if len(ids) > limit {
-		ids = ids[:limit]
-	}
-	out, err := m.memoriesByID(ids)
+	out, err := m.memoriesByID(fuse(lex, vec, k))
 	if err != nil {
-		return nil, false, err
+		return nil, err
 	}
 	for i := range out {
 		rel, err := m.related(out[i].Id)
 		if err != nil {
-			return nil, false, err
+			return nil, err
 		}
 		out[i].Related = rel
 	}
-	return out, hasMore, nil
-}
-
-// filterClause turns a Filter into the exact-match predicates it asks for and
-// their arguments, or an empty string when it names nothing. Every set field
-// is ANDed, and the values are bound, never interpolated.
-func filterClause(f Filter) (string, []any) {
-	var parts []string
-	var args []any
-	for _, field := range []struct{ column, value string }{
-		{"memory.kind", f.Kind},
-		{"memory.scope", f.Scope},
-		{"memory.status", f.Status},
-		{"memory.origin", f.Origin},
-	} {
-		if field.value != "" {
-			parts = append(parts, field.column+" = ?")
-			args = append(args, field.value)
-		}
-	}
-	if len(parts) == 0 {
-		return "", nil
-	}
-	return " AND " + strings.Join(parts, " AND "), args
+	return out, nil
 }
 
 // lexical ranks up to k live memories by FTS5 bm25, best first.
-func (m *Matchers) lexical(match string, f Filter, k int) ([]int64, error) {
-	where, args := filterClause(f)
-	query := `
+func (m *Matchers) lexical(match string, k int) ([]int64, error) {
+	rows, err := m.reader.readRows(`
 		SELECT memory.id
 		FROM record_fts
 		JOIN memory ON memory.id = record_fts.rowid
 		WHERE record_fts MATCH ?
-		AND memory.deleted_at IS NULL` + where + `
+		AND memory.deleted_at IS NULL
 		ORDER BY bm25(record_fts)
-		LIMIT ?`
-	args = append(append([]any{match}, args...), k)
-	rows, err := m.reader.readRows(query, args...)
+		LIMIT ?`, match, k)
 	if err != nil {
 		return nil, err
 	}
@@ -149,7 +102,7 @@ func (m *Matchers) lexical(match string, f Filter, k int) ([]int64, error) {
 // best first. A row whose vector width differs from the query's is skipped,
 // never compared across widths, and a row with no shared direction (cosine <=
 // 0) is not a match. The query is embedded once per search, not once per row.
-func (m *Matchers) vector(q string, f Filter, k int) ([]int64, error) {
+func (m *Matchers) vector(q string, k int) ([]int64, error) {
 	qv, err := m.embedder(q)
 	if err != nil {
 		return nil, err
@@ -157,12 +110,11 @@ func (m *Matchers) vector(q string, f Filter, k int) ([]int64, error) {
 	if len(qv) == 0 {
 		return nil, errors.New("memstore: search: embedder returned an empty query vector")
 	}
-	where, args := filterClause(f)
 	rows, err := m.reader.readRows(`
 		SELECT record_vec.id, record_vec.vector
 		FROM record_vec
 		JOIN memory ON memory.id = record_vec.id
-		WHERE memory.deleted_at IS NULL`+where, args...)
+		WHERE memory.deleted_at IS NULL`)
 	if err != nil {
 		return nil, err
 	}
@@ -289,7 +241,7 @@ func (m *Matchers) memoriesByID(ids []int64) ([]Memory, error) {
 		ph[i] = "?"
 		args[i] = id
 	}
-	rows, err := m.reader.readRows(`SELECT `+memoryCols+` FROM memory WHERE id IN (`+strings.Join(ph, ",")+`)`, args...)
+	rows, err := m.reader.readRows(`SELECT `+memoryCols+` FROM memory WHERE id IN (`+strings.Join(ph, ",")+")", args...)
 	if err != nil {
 		return nil, err
 	}
