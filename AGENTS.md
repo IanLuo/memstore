@@ -66,16 +66,18 @@ nix develop --command go run ./cmd/bench
 
 ## Architecture elevator
 
-Store owns the `memory` table and its lifecycle, and refuses search and ranking.
+Store owns the `memory` table and its lifecycle, and refuses ranking and HTTP.
 Matchers own recall fusion and refuse writing. The CLI owns the verb surface and
-refuses business logic. `Put` and the Importer both write the provenance columns,
-from opposite directions: a caller's value, or fs's event.
+refuses business logic. `web` owns the loopback listener and the page, and
+refuses to touch the file directly. `Put` and the Importer both write the
+provenance columns, from opposite directions: a caller's value, or fs's event.
 
 ```
 cmd/memstore/     — the CLI: parse args, call the store, print JSON. No logic.
 cmd/bench/        — the NFR harness: p50/p95 at 1x and 10x, recall probes, size.
-store.go          — Store: schema, the lifecycle verbs, import, projections.
+store.go          — Store: schema, the lifecycle verbs, Query, import, projections.
 matchers.go       — Matchers: lexical ∪ relation-walk ∪ optional vector, read-only.
+web/              — the read-only UI: Handler, security guard, embedded index.html.
 .agents/specs/    — the locked contract and its system design.
 .agents/dispatch/ — the card each slice was built from.
 ```

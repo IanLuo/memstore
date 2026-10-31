@@ -3,7 +3,9 @@
 A portable memory store. One SQLite file holds every memory, so knowledge crosses
 the session and the repo boundary.
 
-The store is single user, local and offline. It has no server and no network.
+The store is single user, local and offline. `serve` exposes a read-only view on
+the loopback interface only; it never writes a memory and never listens on a
+network address.
 
 ## Verbs
 
@@ -17,6 +19,7 @@ recent [-k N] [SCOPE...]                        newest memories first, as JSON
 link FROM REL TO                                record an edge; the walk surfaces superseded-by / found-by
 stats                                           the store's shape: counts, file bytes, ts bounds
 import SRC_STORE.db                             ingest fs events one-way (provenance recorded, idempotent)
+serve [-port N]                                 read-only web view on 127.0.0.1 (default port 8765)
 ```
 
 The store is `$MEMSTORE_DB`, or `~/.memstore/memory.db` when that is unset.
@@ -31,6 +34,30 @@ The first search shares a stem with the memory and returns it. The second shares
 none, and `search` is lexical — **no embedder exists anywhere in this project** —
 so zero overlap returns `[]`. That is the limit below, not a failure.
 
+## The view
+
+```bash
+memstore serve                 # http://127.0.0.1:8765
+memstore serve -port 8790
+```
+
+Four views over the same file:
+
+- **Memory library** — real search and exact `kind`/`scope`/`status`/`origin`
+  filters, paged results, and a detail panel with provenance and stored relations.
+- **Agent view** — the same query, shown as the candidates memstore would return,
+  with a rough text-size estimate (bytes ÷ 4). It is not a record of what an agent
+  received: prompt, context and cache state are unknown and shown as unknown.
+- **Store status** — live `stats` values, kept apart from static capability notes.
+- **Fresh-agent handoff** — a packet for an agent with no conversation history:
+  goal, checkout, current state, constraints, selected source memories, evidence,
+  risks and next action. It is built in the browser, never saved, and copied or
+  downloaded only when you ask.
+
+The server is read-only: GET and HEAD, loopback `Host` only, no CORS, no external
+asset, `Cache-Control: no-store`. It reaches data through the Go package and never
+opens SQLite itself.
+
 ## Test
 
 `go` is not on `PATH`; the flake supplies Go 1.27. From the repo root:
@@ -39,7 +66,7 @@ so zero overlap returns `[]`. That is the limit below, not a failure.
 nix develop --command go test ./...
 nix develop --command go build ./...
 nix develop --command go vet ./...
-nix develop --command gofmt -l cmd *.go   # vendor/ is third-party; only gofmt walks it
+nix develop --command gofmt -l cmd *.go web/*.go   # vendor/ is third-party; only gofmt walks it
 ```
 
 The NFR benchmark is `nix develop --command go run ./cmd/bench`.
@@ -73,4 +100,6 @@ These are not caveats to read past; they bound what the store can do.
   and its sort order in one index. A v1 file is refused rather than read as 1970.
 - **Content is immutable.** Only `status`, `deleted_at` and `tier` change after a
   `put`. A correction is a new row plus `close`, never an update.
-- **One writer at a time.** One local file, no server, no network.
+- **One writer at a time.** One local file, no network service. `serve` is a
+  read-only opener on loopback: it cannot write, and it shows candidate memories
+  rather than what any agent was actually given.

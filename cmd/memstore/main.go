@@ -41,6 +41,8 @@ func main() {
 		err = runStats(os.Args[2:])
 	case "import":
 		err = runImport(os.Args[2:])
+	case "serve":
+		err = runServe(os.Args[2:])
 	default:
 		usage()
 		os.Exit(2)
@@ -73,6 +75,7 @@ func usage() {
   link FROM REL TO                                record an edge; the walk surfaces superseded-by / found-by
   stats                                           the store's shape: counts, file bytes, ts bounds
   import SRC_STORE.db                             ingest fs events one-way (provenance recorded, idempotent)
+  serve [-port N]                                 read-only web view on 127.0.0.1 (default port 8765)
 
 The store is $MEMSTORE_DB, or ~/.memstore/memory.db.
 `)
