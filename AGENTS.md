@@ -36,9 +36,9 @@ nix develop --command go run ./cmd/bench
   returns it, best first. With zero shared stems and no embedder, the store
   returns fewer results, never a wrong one. The vector matcher is absent unless
   `SetEmbedder` is called; do not call the lexical path "search by meaning".
-- **The CLI verb surface is frozen**: `put get search recent link close forget stats
-  import`. `serve` starts the read-only UI; UI reads map only to existing
-  `Stats`, `Recent`, `Search`, and `Get` package methods.
+- **The CLI verb surface is frozen**: `put get search recent link close forget stats`.
+  `serve` starts the read-only UI; UI reads map only to existing `Stats`,
+  `Recent`, `Search`, and `Get` package methods.
 - **Content is immutable.** Only `status`, `deleted_at` and `tier` change after a
   put. A correction is a new row plus `close`, never an update.
 - **`forget` is one-way.** It sets `deleted_at`, and no verb restores it — a
@@ -70,13 +70,13 @@ nix develop --command go run ./cmd/bench
 Store owns the `memory` table and lifecycle. Matchers own recall ranking and
 refuse writing. The CLI owns the verbs and carries no business logic. `web` owns
 the loopback listener and page, and uses only the public `Search`, `Recent`,
-`Get` and `Stats` methods; it does not add a database interface. `Put` and the
-Importer write provenance from opposite directions: caller values or fs events.
+`Get` and `Stats` methods; it does not add a database interface. `Put` is the
+store's only writer, and it writes provenance from the caller.
 
 ```
 cmd/memstore/     — CLI: parse args, call store, print JSON; serve starts web.
 cmd/bench/        — NFR harness: p50/p95, recall probes, size.
-store.go          — schema, lifecycle verbs, Search/Recent/Get/Stats, import.
+store.go          — schema, lifecycle verbs, Search/Recent/Get/Stats.
 matchers.go       — lexical ∪ optional vector ranking and related edges; read-only.
 web/              — read-only loopback UI using existing public store methods.
 .agents/specs/    — locked contract and system design.

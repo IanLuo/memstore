@@ -18,18 +18,18 @@
 - Falsifiable by comparing every displayed record and statistic with the corresponding public Store operation. V1 configures no embedder; zero-overlap semantic recall is not promised.
 
 ## Scope in / out + primary flow
-- **In:** one SQLite store; lexical ∪ relation-walk ∪ optional vector search; existing CLI verbs plus `serve`; one-way fs import; loopback read-only UI; `stats` overview; recent records via `Recent(scope, k)`; text search via `Search(q, k)`; one record via `Get(id)`; a projects/tasks view composed from recent stored records and their actual labels; an agent-retrieval view showing exact Search results and rank.
+- **In:** one SQLite store; lexical ∪ relation-walk ∪ optional vector search; the CLI verbs plus `serve`; loopback read-only UI; `stats` overview; recent records via `Recent(scope, k)`; text search via `Search(q, k)`; one record via `Get(id)`; a projects/tasks view composed from recent stored records and their actual labels; an agent-retrieval view showing exact Search results and rank.
 - **Selection:** visible scope and memory options come only from `Recent` rows already loaded into the UI. The UI labels the scope choices as incomplete; no all-scope catalogue exists. A selected memory can seed a Search query using its stored title or first text line; the UI still calls ordinary `Search(q,k)` and shows its exact results.
 - **Interface boundary:** the server/UI uses only existing public memstore reads: `Stats`, `Recent`, `Search`, and `Get`. No new query, filter, relation, listing, or database interface is added for the UI. The handler does not query SQLite. UI controls must map directly to the arguments those existing operations accept.
 - **Primary UI flow:** start server → inspect live `stats` → browse `recent` records in a scope → open a record through `get` → run a likely fresh-agent query through `search` → compare exact results with stored scope records → decide what instruction or follow-up is needed.
 - **Out (non-goals):**
   - LAN access, multi-user, accounts or auth — loopback only, one user.
-  - UI writes or lifecycle actions (`put`, `close`, `forget`, `link`, `import`) — read-only.
+  - UI writes or lifecycle actions (`put`, `close`, `forget`, `link`) — read-only.
   - Combined structured filters that the CLI/store API does not expose — do not add them just for the UI.
   - A handoff composer, copied packet, or agent-context simulator — the useful “handoff view” is the stored context returned by normal memstore reads, not a manually authored summary.
   - Claims about actual agent retrieval, prompt inclusion, context-window occupancy, provider cache, task progress, or project health not stored in memstore — no such integration/model exists.
   - Telemetry, external services, outbound network calls, external assets.
-- **Primary flow:** open file → `put`/`import` records → agent or operator uses `search`/`recent`/`get` → UI shows those same records and live stats so the operator can see what the store can provide and what is missing.
+- **Primary flow:** open file → `put` records → agent or operator uses `search`/`recent`/`get` → UI shows those same records and live stats so the operator can see what the store can provide and what is missing.
 
 ## Acceptance criteria
 - GIVEN an empty store WHEN `put` a memory THEN `get` returns it with byte-identical text and an equal timestamp (zone normalises to UTC; the instant is preserved at nanosecond resolution).
@@ -71,7 +71,7 @@
 - Only existing public package reads (`Stats`, `Recent`, `Search`, `Get`) may read data for the UI. No UI-driven API additions. *Invalidated by:* an explicit user decision to change the CLI/package surface.
 - `serve` configures no embedder; zero-overlap semantic search is not provided. *Invalidated by:* an approved model integration with defined cache behavior.
 - No agent or provider telemetry exists, so a candidate is never proof of retrieval. *Invalidated by:* an integration that reports actual retrieval and provider cache use.
-- fs remains the import source; a change to its schema triggers review. *Invalidated by:* fs changing shape.
+- Nothing else writes this store: fs's projection that once did was deleted, so the file has one writer, `put`. *Invalidated by:* a second writer appearing — reopen the concurrency and provenance contract.
 
 ## Data requirements
 - **Inputs:** memories — `kind`, `scope`, `text`, optional `extra`, provenance (`origin`, `origin_id`, `ref`, `fs_node`) and relations. UI requests mirror the existing command arguments: `recent` scope and k; `search` non-empty query and k; `get` id; `stats` no arguments. Store path comes from environment or home default.

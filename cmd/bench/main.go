@@ -1,6 +1,6 @@
-// Command bench is the memory store's NFR benchmark and the fs-import dry-run.
-// It is evidence, not part of the store: it reaches the store only through its
-// public surface, and it writes only under -work (a fresh temp dir by default).
+// Command bench is the memory store's NFR benchmark. It is evidence, not part
+// of the store: it reaches the store only through its public surface, and it
+// writes only under -work (a fresh temp dir by default).
 //
 // Part A measures, at N = 1000 and 10000 memories: Open (fresh and with rows
 // present), Put throughput, Search p50/p95 over a fixed query set, the
@@ -10,11 +10,6 @@
 // measured observations, because that spec states them as observations, not
 // bounds.
 //
-// Part B copies an fs-style store (never the original), imports the copy into a
-// throwaway memstore, and reports the mapping numbers, the events-vs-nodes
-// shape, and a small set of recall probes — each also run through the fs
-// binary's own `query`, when -fsbin is given, for comparison.
-//
 // Part C copies a real memstore file (never the original) and times its
 // scope-listing read, Store.Recent(scope, k), with the spread and the
 // EXPLAIN QUERY PLAN beside it — the read cost this store's scope index exists
@@ -23,13 +18,11 @@ package main
 
 import (
 	"database/sql"
-	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
 	"math"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -122,15 +115,6 @@ func querySet(q int) []string {
 	return out
 }
 
-// probes are the Part B recall queries: real work this machine's fs store holds.
-var probes = []string{
-	"lock regime currency",
-	"worker died resume",
-	"spec lock marker",
-	"import provenance",
-	"binary fresh build",
-}
-
 type config struct {
 	sizes    []int
 	queries  int
@@ -138,8 +122,6 @@ type config struct {
 	passes   int
 	openReps int
 	work     string
-	src      string
-	fsbin    string
 	part     string
 
 	// Part C — the scope-listing read.
@@ -158,9 +140,7 @@ func main() {
 		passes   = flag.Int("passes", 3, "timed passes over the query set")
 		openReps = flag.Int("openreps", 30, "open repetitions per phase")
 		work     = flag.String("work", "", "working directory (default: a fresh temp dir)")
-		src      = flag.String("src", "~/.fs/store.db", "fs-style source store for part B (copied, never opened in place)")
-		fsbin    = flag.String("fsbin", "", "fs binary; when set, part B also runs `fs query` for each probe")
-		part     = flag.String("part", "all", "a, b, c, or all")
+		part     = flag.String("part", "all", "a, c, or all")
 		memsrc   = flag.String("memsrc", "~/.memstore/memory.db", "memstore file for part C (copied, never opened in place)")
 		scopeK   = flag.Int("scopek", 1<<20, "k a scope listing asks for in part C (fs's recentLimit)")
 		runs     = flag.Int("runs", 30, "timed runs per scope in part C")
@@ -169,7 +149,7 @@ func main() {
 	)
 	flag.Parse()
 
-	cfg := config{queries: *queries, k: *k, passes: *passes, openReps: *openReps, part: *part, src: expandHome(*src), fsbin: *fsbin,
+	cfg := config{queries: *queries, k: *k, passes: *passes, openReps: *openReps, part: *part,
 		memsrc: expandHome(*memsrc), scopeK: *scopeK, runs: *runs, warmup: *warmup, scopes: *scopes}
 	for _, s := range strings.Split(*nFlag, ",") {
 		s = strings.TrimSpace(s)
@@ -198,11 +178,6 @@ func main() {
 	if cfg.part == "a" || cfg.part == "all" {
 		if err := partA(cfg); err != nil {
 			fatal("part A: %v", err)
-		}
-	}
-	if cfg.part == "b" || cfg.part == "all" {
-		if err := partB(cfg); err != nil {
-			fatal("part B: %v", err)
 		}
 	}
 	if cfg.part == "c" || cfg.part == "all" {
@@ -438,122 +413,6 @@ func printNFRSection(rs []result) {
 	fmt.Println()
 }
 
-func partB(cfg config) error {
-	fmt.Printf("=== Part B: fs-import dry-run ===\n")
-	srcStat, err := os.Stat(cfg.src)
-	if err != nil {
-		return fmt.Errorf("source %s: %w", cfg.src, err)
-	}
-	// The card's rule: never touch the original. The importer snapshots the
-	// source into its own temp copy; this copy is made first so that even the
-	// snapshot reads a file this process created.
-	srcCopy := filepath.Join(cfg.work, "source-copy.db")
-	if err := copyFile(srcCopy, cfg.src); err != nil {
-		return err
-	}
-	fmt.Printf("source     : %s (%d B) -- copied to %s; the original is never opened in place\n", cfg.src, srcStat.Size(), srcCopy)
-
-	memPath := filepath.Join(cfg.work, "imported.db")
-	s, err := memstore.Open(memPath)
-	if err != nil {
-		return err
-	}
-	imported, skipped, err := s.Import(srcCopy, memstore.ImportOptions{})
-	if err != nil {
-		s.Close()
-		return fmt.Errorf("import: %w", err)
-	}
-	if err := s.Close(); err != nil {
-		return err
-	}
-	fmt.Printf("import     : imported %d, skipped %d  (command: memstore.Store.Import(%s, ImportOptions{}))\n", imported, skipped, srcCopy)
-	fi, err := os.Stat(memPath)
-	if err != nil {
-		return err
-	}
-	wal := int64(0)
-	if wfi, err := os.Stat(memPath + "-wal"); err == nil {
-		wal = wfi.Size()
-	}
-	fmt.Printf("memstore db: %s (%d B; wal at rest %d B)\n", memPath, fi.Size(), wal)
-
-	kindSplit, total, err := reportKinds(memPath)
-	if err != nil {
-		return err
-	}
-	fmt.Printf("kind split : %d memories\n", total)
-	for _, k := range kindSplit {
-		fmt.Printf("             %-16s %5d\n", k.kind, k.n)
-	}
-	textBytes, err := reportTextBytes(memPath)
-	if err != nil {
-		return err
-	}
-	if textBytes > 0 {
-		fmt.Printf("size ratio : db %d B / text %d B = %.3f (avg memory text %.0f B; the Part A benchmark corpus is ~84 B, which is why its ratio is higher)\n", fi.Size(), textBytes, float64(fi.Size())/float64(textBytes), float64(textBytes)/float64(total))
-	}
-
-	oldest, newest, err := reportTs(memPath)
-	if err != nil {
-		return err
-	}
-	fmt.Printf("ts bounds  : oldest %s, newest %s\n", oldest, newest)
-
-	srcEvents, srcNodes, srcProjects, perNode, err := reportSourceShape(srcCopy)
-	if err != nil {
-		return err
-	}
-	fmt.Printf("source shape: %d events, %d distinct node_id, %d distinct project_id; events/node mean %.2f, median %d, max %d; %d nodes carry exactly 1 event\n", srcEvents, srcNodes, srcProjects, perNode.mean, perNode.median, perNode.max, perNode.singletons)
-	fmt.Printf("             content events (decision/knowledge/report/plan/delivery): %d; lifecycle (status-changed/task-created/metadata-changed/task-blocked/project-created/cap-claimed/task-unblocked): %d; events with no node_id: %d\n", perNode.content, perNode.lifecycle, perNode.noNode)
-	fmt.Printf("             top nodes by events: ")
-	parts := make([]string, 0, len(perNode.top))
-	for _, t := range perNode.top {
-		parts = append(parts, fmt.Sprintf("%s/%s=%d", t.project, t.node, t.c))
-	}
-	fmt.Println(strings.Join(parts, " "))
-	fmt.Println()
-	fmt.Printf("events-vs-nodes: the importer is event-per-row: %d fs events become %d memory rows spread over %d distinct nodes — %.2f rows per node (median %d). Is that a memory or a log? A memory is one row per fact; this is a log replayed into a table. A node-shaped import (one row per node holding its content net — goal, decisions, knowledge, reports) would hold %d rows; a content-only import (one row per content event) would hold %d; this importer holds %d. The %d rows it keeps that a memory has no reason to are lifecycle clock (status-changed, task-created, metadata-changed, task-blocked, project-created, cap-claimed, task-unblocked). What node-shaping changes: 7x fewer rows, one place to read a node's net, no replay to reconstruct state; what it costs: the per-event trail — the why of a node's changes — is gone. For the fs-adoption question both shapes keep the same text; the size and the answer are dictated by whether the lifecycle rows are memory (content %d events on %d nodes) or a clock (%d events).\n", srcEvents, srcEvents, srcNodes, perNode.mean, perNode.median, perNode.contentNodes, perNode.content, srcEvents, perNode.lifecycle, perNode.content, perNode.contentNodes, perNode.lifecycle)
-	fmt.Println()
-
-	projects, err := reportProjects(srcCopy)
-	if err != nil {
-		return err
-	}
-
-	hits, err := recallProbes(memPath, probes, 5)
-	if err != nil {
-		return err
-	}
-	for _, h := range hits {
-		fmt.Printf("probe %q\n", h.query)
-		fmt.Printf("  memstore search k=5: %d hits\n", len(h.rows))
-		for i, row := range h.rows {
-			fmt.Printf("    #%d id=%d kind=%s scope=%s fs_node=%s ts=%s title=%q\n", i+1, row.Id, row.Kind, row.Scope, row.FsNode, row.Ts.Format(time.RFC3339Nano), clip(row.Title, 90))
-		}
-		if cfg.fsbin == "" {
-			fmt.Printf("  fs query: skipped (-fsbin not set)\n")
-			continue
-		}
-		evs, err := fsQuery(cfg.fsbin, h.query, projects)
-		if err != nil {
-			fmt.Printf("  fs query: ERROR %v\n", err)
-			continue
-		}
-		fmt.Printf("  fs query (.data.events) across %d projects: %d events\n", len(projects), len(evs))
-		for i, e := range evs {
-			if i >= 5 {
-				fmt.Printf("    ... %d more\n", len(evs)-5)
-				break
-			}
-			fmt.Printf("    #%d %s %s project=%s node=%s\n", i+1, e.ID, e.Type, e.ProjectID, e.NodeID)
-		}
-	}
-	fmt.Println()
-	fmt.Printf("events-vs-nodes observation: this import is one memory row per fs EVENT, so the store holds %d rows for %d distinct nodes (%.2f rows/node).\n", srcEvents, srcNodes, perNode.mean)
-	fmt.Println()
-	return nil
-}
-
 // benchMemoryCols is the column list Recent reads, in scan order. Part C asks
 // the plan for the query Recent issues, so the projection must match.
 const benchMemoryCols = `memory.id, memory.ts, memory.kind, memory.scope, memory.title,
@@ -762,168 +621,6 @@ func reportTs(path string) (oldest, newest string, err error) {
 		return "", "", nil
 	}
 	return time.Unix(0, lo.Int64).UTC().Format(time.RFC3339Nano), time.Unix(0, hi.Int64).UTC().Format(time.RFC3339Nano), nil
-}
-
-func reportProjects(path string) ([]string, error) {
-	db, err := sql.Open("sqlite", path)
-	if err != nil {
-		return nil, err
-	}
-	defer db.Close()
-	rows, err := db.Query(`SELECT DISTINCT project_id FROM events ORDER BY project_id`)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	var out []string
-	for rows.Next() {
-		var p string
-		if err := rows.Scan(&p); err != nil {
-			return nil, err
-		}
-		out = append(out, p)
-	}
-	return out, rows.Err()
-}
-
-type nodeStat struct {
-	project string
-	node    string
-	c       int
-}
-
-type shape struct {
-	mean         float64
-	median       int
-	max          int
-	singletons   int
-	content      int
-	contentNodes int
-	lifecycle    int
-	noNode       int
-	top          []nodeStat
-}
-
-func reportSourceShape(path string) (events, nodes, projects int, s shape, err error) {
-	db, err := sql.Open("sqlite", path)
-	if err != nil {
-		return 0, 0, 0, s, err
-	}
-	defer db.Close()
-	if err := db.QueryRow(`SELECT count(*), count(DISTINCT node_id), count(DISTINCT project_id) FROM events`).Scan(&events, &nodes, &projects); err != nil {
-		return 0, 0, 0, s, err
-	}
-	if err := db.QueryRow(`SELECT count(*) FROM events WHERE node_id IS NULL`).Scan(&s.noNode); err != nil {
-		return 0, 0, 0, s, err
-	}
-	if err := db.QueryRow(`SELECT count(*) FROM events WHERE type IN ('decision-recorded','knowledge-added','report-recorded','plan-recorded','delivery-recorded')`).Scan(&s.content); err != nil {
-		return 0, 0, 0, s, err
-	}
-	if err := db.QueryRow(`SELECT count(DISTINCT node_id) FROM events WHERE type IN ('decision-recorded','knowledge-added','report-recorded','plan-recorded','delivery-recorded') AND node_id IS NOT NULL`).Scan(&s.contentNodes); err != nil {
-		return 0, 0, 0, s, err
-	}
-	s.lifecycle = events - s.content
-	rows, err := db.Query(`SELECT project_id, node_id, count(*) c FROM events WHERE node_id IS NOT NULL GROUP BY node_id ORDER BY c DESC, node_id`)
-	if err != nil {
-		return 0, 0, 0, s, err
-	}
-	defer rows.Close()
-	var counts []int
-	for rows.Next() {
-		var n nodeStat
-		if err := rows.Scan(&n.project, &n.node, &n.c); err != nil {
-			return 0, 0, 0, s, err
-		}
-		counts = append(counts, n.c)
-		if len(s.top) < 5 {
-			s.top = append(s.top, n)
-		}
-	}
-	if err := rows.Err(); err != nil {
-		return 0, 0, 0, s, err
-	}
-	for _, c := range counts {
-		if c == 1 {
-			s.singletons++
-		}
-	}
-	if len(counts) == 0 {
-		return events, nodes, projects, s, nil
-	}
-	total := 0
-	for _, c := range counts {
-		total += c
-	}
-	s.mean = float64(total) / float64(len(counts))
-	sorted := append([]int(nil), counts...)
-	sort.Ints(sorted)
-	s.median = sorted[len(sorted)/2]
-	s.max = sorted[len(sorted)-1]
-	return events, nodes, projects, s, nil
-}
-
-type probeHit struct {
-	query string
-	rows  []memstore.Memory
-}
-
-func recallProbes(memPath string, qs []string, k int) ([]probeHit, error) {
-	s, err := memstore.Open(memPath)
-	if err != nil {
-		return nil, err
-	}
-	defer s.Close()
-	out := make([]probeHit, 0, len(qs))
-	for _, q := range qs {
-		h, err := s.Search(q, k)
-		if err != nil {
-			return nil, fmt.Errorf("probe %q: %w", q, err)
-		}
-		out = append(out, probeHit{query: q, rows: h})
-	}
-	return out, nil
-}
-
-type fsEvent struct {
-	ID        string `json:"id"`
-	Type      string `json:"type"`
-	ProjectID string `json:"project_id"`
-	NodeID    string `json:"node_id"`
-}
-
-type fsDoc struct {
-	OK   bool `json:"ok"`
-	Data struct {
-		Events []fsEvent `json:"events"`
-	} `json:"data"`
-}
-
-// fsQuery runs `<fsbin> query <q> --project <p>` for every project and returns
-// the merged events. fs query is scoped to one project, so a whole-store
-// comparison is the union over the projects the source holds.
-func fsQuery(fsbin, q string, projects []string) ([]fsEvent, error) {
-	var out []fsEvent
-	for _, p := range projects {
-		cmd := exec.Command(fsbin, "query", q, "--project", p)
-		stdout, err := cmd.Output()
-		if err != nil {
-			return nil, fmt.Errorf("fs query %q --project %s: %w", q, p, err)
-		}
-		var doc fsDoc
-		if err := json.Unmarshal(stdout, &doc); err != nil {
-			return nil, fmt.Errorf("fs query %q --project %s: parse: %w", q, p, err)
-		}
-		out = append(out, doc.Data.Events...)
-	}
-	return out, nil
-}
-
-func clip(s string, n int) string {
-	s = strings.ReplaceAll(s, "\n", " ")
-	if len(s) <= n {
-		return s
-	}
-	return s[:n] + "..."
 }
 
 func copyFile(dst, src string) error {

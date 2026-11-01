@@ -18,7 +18,6 @@ forget ID                                       hide a memory (soft delete; its 
 recent [-k N] [SCOPE...]                        newest memories first, as JSON
 link FROM REL TO                                record an edge; the walk surfaces superseded-by / found-by
 stats                                           the store's shape: counts, file bytes, ts bounds
-import SRC_STORE.db                             ingest fs events one-way (provenance recorded, idempotent)
 serve [-port N]                                 read-only web view on 127.0.0.1 (default port 8765)
 ```
 
