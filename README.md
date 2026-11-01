@@ -17,7 +17,7 @@ close ID [REPLACED_BY]                          close a memory; optionally retir
 forget ID                                       hide a memory (soft delete; its bytes remain)
 recent [-k N] [SCOPE...]                        newest memories first, as JSON
 link FROM REL TO                                record an edge; the walk surfaces superseded-by / found-by
-stats                                           the store's shape: counts, file bytes, ts bounds
+stats                                           the store's shape: counts, file bytes, ts bounds, live rows per scope
 serve [-port N]                                 read-only web view on 127.0.0.1 (default port 8765)
 ```
 

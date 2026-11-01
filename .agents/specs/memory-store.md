@@ -18,7 +18,7 @@
 - Falsifiable by comparing every displayed record and statistic with the corresponding public Store operation. V1 configures no embedder; zero-overlap semantic recall is not promised.
 
 ## Scope in / out + primary flow
-- **In:** one SQLite store; lexical ∪ relation-walk ∪ optional vector search; the CLI verbs plus `serve`; loopback read-only UI; `stats` overview; recent records via `Recent(scope, k)`; text search via `Search(q, k)`; one record via `Get(id)`; a projects/tasks view composed from recent stored records and their actual labels; an agent-retrieval view showing exact Search results and rank.
+- **In:** one SQLite store; lexical ∪ relation-walk ∪ optional vector search; the CLI verbs plus `serve`; loopback read-only UI; `stats` overview, including one entry per distinct scope holding live rows; recent records via `Recent(scope, k)`; text search via `Search(q, k)`; one record via `Get(id)`; a projects/tasks view composed from recent stored records and their actual labels; an agent-retrieval view showing exact Search results and rank.
 - **Selection:** visible scope and memory options come only from `Recent` rows already loaded into the UI. The UI labels the scope choices as incomplete; no all-scope catalogue exists. A selected memory can seed a Search query using its stored title or first text line; the UI still calls ordinary `Search(q,k)` and shows its exact results.
 - **Interface boundary:** the server/UI uses only existing public memstore reads: `Stats`, `Recent`, `Search`, and `Get`. No new query, filter, relation, listing, or database interface is added for the UI. The handler does not query SQLite. UI controls must map directly to the arguments those existing operations accept.
 - **Primary UI flow:** start server → inspect live `stats` → browse `recent` records in a scope → open a record through `get` → run a likely fresh-agent query through `search` → compare exact results with stored scope records → decide what instruction or follow-up is needed.
@@ -43,6 +43,7 @@
 - Empty input: a `put` with empty `text` is rejected; the smallest accepted input is non-empty `text` + `kind`.
 - GIVEN `serve` with no port flag WHEN started THEN it opens the configured store through memstore, binds only `127.0.0.1:8765`, and prints the local URL. A port flag is allowed; no bind-address flag exists. A bind or open failure exits clearly and serves nothing.
 - GIVEN Store status WHEN loaded THEN the shown counts, DB/WAL bytes and timestamp bounds equal `Stats()`. `Stats.Open` is labeled live/not-forgotten, not status=`open`.
+- GIVEN a store holding live rows in several scopes WHEN `stats` runs THEN `Scopes` lists every distinct scope that holds live rows, biggest first and ties by name, counting live rows only; a forgotten row contributes nothing; the empty scope appears when rows carry none. The UI's project selector offers those scopes, except the empty one, which `recent` cannot select because an empty scope there means all scopes. The records shown stay the newest `k` from `recent`.
 - GIVEN a scope and result limit WHEN the project/task view loads THEN its records and order match `Recent(scope, k)` exactly. Empty scope maps to `Recent("", k)`; kind/status labels are displayed as stored and are not interpreted as task completion.
 - GIVEN a query and result limit WHEN Agent retrieval or Memory search runs THEN its records, text and order match `Search(q, k)` exactly. The UI states candidates are not proof that an agent received them, and prompt/context/cache remain unknown.
 - GIVEN a record id WHEN Read full memory is selected THEN its text and fields match `Get(id)`. HTML/script in memory text is rendered as text, not executed.
@@ -75,7 +76,7 @@
 
 ## Data requirements
 - **Inputs:** memories — `kind`, `scope`, `text`, optional `extra`, provenance (`origin`, `origin_id`, `ref`, `fs_node`) and relations. UI requests mirror the existing command arguments: `recent` scope and k; `search` non-empty query and k; `get` id; `stats` no arguments. Store path comes from environment or home default.
-- **Outputs:** the exact results of `Search`, `Recent`, `Get`, and `Stats`. No filter vocabulary, task model, prompt state, or status inference is added.
+- **Outputs:** the exact results of `Search`, `Recent`, `Get`, and `Stats` — where `Stats` carries the per-scope row counts that let a caller list the store's projects. No filter vocabulary, task model, prompt state, or status inference is added.
 - **Must survive:** claims (decisions, knowledge, goals) forever; content immutable. The UI persists nothing. HTTP memory responses are not cached.
 - **Empty record/request:** an empty `put` text is rejected; unknown `kind` is accepted as an open label. Empty search text is rejected like the CLI; empty recent scope means all scopes. A UI request cannot write.
 
@@ -91,7 +92,7 @@
 
 ## Verification plan
 - Store acceptance → automated fixture tests; provenance, version and index cases have dedicated tests; the scope-listing test asserts an indexed SEARCH with no temp b-tree.
-- Existing public reads → HTTP tests compare `stats`, `recent`, `search`, and `get` responses with direct calls to those same Store methods.
+- Existing public reads → HTTP tests compare `stats`, `recent`, `search`, and `get` responses with direct calls to those same Store methods. The scope grouping is pinned by `TestStatsReportsScopes` (order, live-only, empty scope) and measured at 10⁴ rows: p50 0.46 ms, p95 0.52 ms for the grouped read.
 - HTTP → tests for loopback binding and port override, startup failure, allowed methods, non-loopback `Host` refusal, security and cache headers, CLI argument bounds, escaped markup, public-method delegation, absence of write routes, and empty/error responses. Review confirms no SQL or SQLite handle in HTTP code.
 - Browser → desktop and mobile checks against a copy of the real store: `Stats` values, `Recent` scope results/order, `Search` results/order, `Get` text, and explicit unavailable-agent-context labels.
 - NFRs → benchmark Store p95 < 50 ms and HTTP p95 < 200 ms for a 10-result Search at 10⁴ rows, recording the command, fixture and output.

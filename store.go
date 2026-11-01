@@ -773,9 +773,21 @@ type Stats struct {
 	Newest    *time.Time
 	Oldest    *time.Time
 
+	// Scopes is one entry per distinct scope holding live rows, biggest first
+	// and ties by scope name, so a caller can list the store's projects. The
+	// empty scope is a real entry: rows written without one count under "".
+	// Forgotten rows contribute nothing.
+	Scopes []ScopeCount
+
 	// VectorRows is how many rows carry a vector; nil when no embedder is
 	// configured, so the coverage (VectorRows/Total) is absent, not zero.
 	VectorRows *int64 `json:"VectorRows,omitempty"`
+}
+
+// ScopeCount is one scope and how many live rows it holds.
+type ScopeCount struct {
+	Scope string
+	Rows  int64
 }
 
 // Stats returns the store's shape; it writes nothing.
@@ -798,6 +810,26 @@ func (s *Store) Stats() (Stats, error) {
 		return st, fmt.Errorf("memstore: stats: %w", err)
 	}
 	st.Newest, st.Oldest = unixTime(newest), unixTime(oldest)
+	// One grouped read answers "which projects does this store hold?" without a
+	// second interface: it is the same table and the same live-row rule every
+	// other read uses.
+	rows, err := s.db.Query(`SELECT scope, count(*) FROM memory WHERE deleted_at IS NULL
+		GROUP BY scope ORDER BY count(*) DESC, scope`)
+	if err != nil {
+		return st, fmt.Errorf("memstore: stats: %w", err)
+	}
+	defer rows.Close()
+	st.Scopes = []ScopeCount{}
+	for rows.Next() {
+		var sc ScopeCount
+		if err := rows.Scan(&sc.Scope, &sc.Rows); err != nil {
+			return st, fmt.Errorf("memstore: stats: %w", err)
+		}
+		st.Scopes = append(st.Scopes, sc)
+	}
+	if err := rows.Err(); err != nil {
+		return st, fmt.Errorf("memstore: stats: %w", err)
+	}
 	if s.matchers.embedder != nil {
 		var n int64
 		if err := s.db.QueryRow(`SELECT count(*) FROM record_vec`).Scan(&n); err != nil {

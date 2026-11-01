@@ -22,8 +22,8 @@
 - `record_vec`: optional (`id`, `vector`); created only by `SetEmbedder`. `serve` never calls it, so a served store has no vector table and no vector matcher.
 - `idx_memory_origin_origin_id`: UNIQUE over `(origin, origin_id)` WHERE `origin_id` IS NOT NULL.
 - `idx_memory_scope_recent`: over `(scope, deleted_at, ts DESC, id DESC)`; `Recent`'s predicate and order in one index.
-- **Web read boundary:** no Store method is added for the UI. The server maps routes to `Stats()`, `Recent(scope,k)`, `Search(q,k)`, and `Get(id)` only. Any behavior not expressible through those methods is not implemented in the UI.
-- UI lists and labels are derived from returned `Memory` fields. Scope and memory pickers are populated only from an already-loaded `Recent` result; they are explicitly incomplete. Selecting a memory may seed text for a normal `Search` call. The UI must not infer project completion or create a project/task/status model.
+- **Web read boundary:** no Store method is added for the UI. The server maps routes to `Stats()`, `Recent(scope,k)`, `Search(q,k)`, and `Get(id)` only. `Stats()` also carries one row per distinct live scope, so the UI can list the store's projects without a second query interface. Any behavior not expressible through those methods is not implemented in the UI.
+- UI lists and labels are derived from returned `Memory` fields. The scope picker is populated from `Stats().Scopes` (complete, live-only), while the memory pickers are populated from an already-loaded `Recent` result and are explicitly incomplete. Selecting a memory may seed text for a normal `Search` call. The UI must not infer project completion or create a project/task/status model.
 
 ## Boundaries & interfaces
 - Verbs: `put · get · search · recent · link · close · forget(soft) · stats · serve`. `serve` starts a process and returns no memory data; the other verbs are unchanged.
@@ -49,5 +49,5 @@
 - 1 user, 1 writer; 10²–10⁴ memories now, growth ~10²/day.
 - Open is O(1) — no replay; search is O(index); a scoped Recent listing is O(scope rows + log n), served by `idx_memory_scope_recent`. An all-scope Recent request may scan and sort; it uses the existing public `Recent` behavior.
 - Recent and Search default to 10, matching existing CLI defaults. The operator may choose a larger `k`; every result still comes from the same `Recent` or `Search` call the CLI/API exposes. No pagination cursor or offset is added.
-- Target: Store `search` p95 < 50 ms and HTTP p95 < 200 ms for `Search(q, 10)` at 10⁴ rows.
+- Target: Store `search` p95 < 50 ms and HTTP p95 < 200 ms for `Search(q, 10)` at 10⁴ rows. The scope grouping `Stats` adds is one scan of live rows plus a sort of the grouped result: measured p50 0.46 ms, p95 0.52 ms at 10⁴ rows on `cmd/bench`'s corpus.
 - Shard: one file per scope, opened lazily; cold rows tiered out of the hot index.

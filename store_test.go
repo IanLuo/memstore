@@ -1235,6 +1235,49 @@ func TestPutRefusesDuplicateOrigin(t *testing.T) {
 	}
 }
 
+// Stats answers "which projects does this store hold?" with one entry per
+// distinct live scope, biggest first and ties by name. A forgotten row
+// contributes nothing; the empty scope is a real entry, because rows written
+// without one live under it.
+func TestStatsReportsScopes(t *testing.T) {
+	s := openTemp(t)
+	put := func(scope string) int64 {
+		t.Helper()
+		id, err := s.Put(&memstore.Memory{Kind: "note", Scope: scope, Text: "one row in " + scope})
+		if err != nil {
+			t.Fatalf("Put(%q): %v", scope, err)
+		}
+		return id
+	}
+	put("alpha")
+	put("alpha")
+	put("beta")
+	put("beta")
+	put("")
+	gone := put("gamma")
+	if err := s.Forget(gone); err != nil {
+		t.Fatalf("Forget: %v", err)
+	}
+
+	st, err := s.Stats()
+	if err != nil {
+		t.Fatalf("Stats: %v", err)
+	}
+	want := []memstore.ScopeCount{
+		{Scope: "alpha", Rows: 2},
+		{Scope: "beta", Rows: 2},
+		{Scope: "", Rows: 1},
+	}
+	if len(st.Scopes) != len(want) {
+		t.Fatalf("Scopes = %+v, want %+v", st.Scopes, want)
+	}
+	for i := range want {
+		if st.Scopes[i] != want[i] {
+			t.Fatalf("Scopes[%d] = %+v, want %+v (full: %+v)", i, st.Scopes[i], want[i], st.Scopes)
+		}
+	}
+}
+
 // Card acceptance 5: the same origin_id under a different origin coexists —
 // the index is scoped by the pair, so two writers' labels can share an id.
 func TestPutSameOriginIDDifferentOriginCoexists(t *testing.T) {

@@ -115,6 +115,14 @@ func TestStatsMatchStore(t *testing.T) {
 	if got.Total != want.Total || got.Open != want.Open || got.Bytes != want.Bytes || got.WalBytes != want.WalBytes {
 		t.Errorf("stats = %+v, want %+v", got, want)
 	}
+	if len(got.Scopes) != len(want.Scopes) {
+		t.Fatalf("Scopes = %+v, want %+v", got.Scopes, want.Scopes)
+	}
+	for i := range want.Scopes {
+		if got.Scopes[i] != want.Scopes[i] {
+			t.Errorf("Scopes[%d] = %+v, want %+v", i, got.Scopes[i], want.Scopes[i])
+		}
+	}
 }
 
 func TestSearchMatchesPublicStoreSearch(t *testing.T) {
