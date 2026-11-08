@@ -1,5 +1,10 @@
-# Spec — the personal profile: a bounded digest of current factors
+<!-- specs:locked:f63a63c 2026-11-08 type=spec -->
 
+## Link contract
+- **upstream** (this doc relies on): .agents/specs/memory-store.md
+- **referrers** (must cite this when they change): .agents/specs/memory-store-design.md, AGENTS.md
+
+# Spec — the personal profile: a bounded digest of current factors
 Relies on `.agents/specs/memory-store.md` for the store's guarantees — immutable
 content, one writer, soft forget, and no inference. This doc does not restate them.
 

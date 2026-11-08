@@ -1,4 +1,4 @@
-<!-- specs:locked:7637285 2026-11-01 type=system-design -->
+<!-- specs:locked:f63a63c 2026-11-08 type=system-design -->
 
 ## Link contract
 - **upstream** (this doc relies on): .agents/specs/memory-store.md
