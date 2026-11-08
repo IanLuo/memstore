@@ -11,7 +11,7 @@
 - **Matchers** — owns recall fusion (lexical ∪ relation-walk ∪ optional vector). **Refuses:** writing.
 - **HTTP server** — owns loopback listener, routing, argument validation, response encoding and security headers. Calls only `Search`, `Recent`, `Get`, and `Stats`; contains no SQLite access and adds no Store/query interface.
 - **Web UI** — uses the exact operation semantics and arguments available to the CLI. Projects/tasks is a view over recent records and stored labels; agent retrieval shows exact Search results. No project-state inference or manual handoff composer.
-- **CLI** — existing verbs unchanged; `serve` process wiring only.
+- **CLI** — existing verbs unchanged, except `profile`, a read-only verb this doc did not own when it was locked; see `.agents/specs/personal-profile.md`. `serve` process wiring only.
 
 ## Data model
 - `memory`: `id · ts · kind · scope · title · text · extra · importance · tier · status · deleted_at · parent · supersedes · found_by · hash · origin · origin_id · ref · fs_node`.
@@ -26,7 +26,7 @@
 - UI lists and labels are derived from returned `Memory` fields. The scope picker is populated from `Stats().Scopes` (complete, live-only), while the memory pickers are populated from an already-loaded `Recent` result and are explicitly incomplete. Selecting a memory may seed text for a normal `Search` call. The UI must not infer project completion or create a project/task/status model.
 
 ## Boundaries & interfaces
-- Verbs: `put · get · search · recent · link · close · forget(soft) · stats · serve`. `serve` starts a process and returns no memory data; the other verbs are unchanged.
+- Verbs: `put · get · search · recent · link · close · forget(soft) · stats · serve · profile(read)`. `serve` starts a process and returns no memory data; `profile` is a bounded digest of current factors, specified by `.agents/specs/personal-profile.md`; the other verbs are unchanged.
 - `serve` binds `127.0.0.1` only, defaulting to port 8765 with a port flag and no bind-address flag. The store path is `MEMSTORE_DB` or the home default; the browser cannot select a path.
 - HTTP surface, all GET/HEAD, same origin: `/` (UI), `/api/stats`, `/api/search?q=&k=`, `/api/recent?scope=&k=`, `/api/get?id=`. Routes preserve the semantics of the matching CLI verb. Any other method is 405; no route writes.
 - A handler translates the request into `Store.Search`, `Store.Recent`, `Store.Get` or `Store.Stats`, then encodes JSON. No SQL is constructed by the HTTP layer.
