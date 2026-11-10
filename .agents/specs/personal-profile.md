@@ -14,8 +14,8 @@ content, one writer, soft forget, and no inference. This doc does not restate th
 - **Why now:** on-demand reads are cheap (50 ms), but nothing in the store states what is current or what repeats. Every reader would have to reconstruct it.
 
 ## Non-negotiable outcome
-- One read returns a **bounded digest of current state**: at most 64 factors and at most 4 KB, one row per factor, computed from `memory` alone, stating no verdict.
-- Falsifiable without argument: put 500 factors, read once → at most 64 rows and at most 4 KB, with an exact `omitted` count. Put three versions of one factor, read once → one row.
+- One read returns a **bounded digest of current state**: at most 64 factors and at most 24 KB, one row per factor, computed from `memory` alone, stating no verdict.
+- Falsifiable without argument: put 500 factors, read once → at most 64 rows and at most 24 KB, with an exact `omitted` count. Put three versions of one factor, read once → one row.
 - Not this: a summary that loses detail, an inference engine, or a second source of truth.
 - The digest is a projection of `memory`. It is never authoritative, never written, and cannot go stale, because it does not persist.
 
@@ -38,7 +38,7 @@ content, one writer, soft forget, and no inference. This doc does not restate th
 - **Not a factor.** GIVEN a row whose title is empty or only spaces, or a forgotten row WHEN `profile` runs THEN it is absent and adds to no count.
 - **Title rule.** GIVEN `Build timeout` and `  build TIMEOUT  ` THEN one factor. GIVEN `build timeout` and `build-timeout` THEN two factors.
 - **Scopes.** GIVEN one title in scopes `a` and `b` WHEN `profile -scope a` runs THEN count is that of `a` alone and `scopes` is 1; WHEN `profile -scope a,b` runs THEN the counts merge and `scopes` is 2.
-- **Bound.** GIVEN 500 factors WHEN `profile` runs THEN ≤ 64 rows and ≤ 4 KB, and `omitted` states the exact number cut.
+- **Bound.** GIVEN 500 factors WHEN `profile` runs THEN ≤ 64 rows and ≤ 24 KB of JSON, and `omitted` states the exact number cut. The byte budget is enforced while the output is built: a row that would exceed 24 KB is not added, and it counts in `omitted`. Titles and values are each cut at 200 characters, so one row cannot exceed the budget alone.
 - **Order.** GIVEN two factors where one was seen later WHEN `profile -k 1` runs THEN the later one returns.
 - **Determinism.** GIVEN no write between two calls THEN the outputs are byte-identical.
 - **Empty.** GIVEN an empty store WHEN `profile` runs THEN an empty list, exit 0. GIVEN `-k 0` THEN an empty list.
@@ -46,12 +46,12 @@ content, one writer, soft forget, and no inference. This doc does not restate th
 - **Smallest accepted input:** one row with a non-empty title. **Smallest rejected:** `profile -nope`, an unknown flag — rejected like every other verb.
 
 ## KPIs & failure signal
-- **Good:** 8 of 10 fixed standing-fact probes are answered by the digest alone without a `search`; the read holds p95 < 50 ms at 10⁴ rows; the digest holds ≤ 4 KB at 500 factors.
+- **Good:** 8 of 10 fixed standing-fact probes are answered by the digest alone without a `search`; the read holds p95 < 50 ms at 10⁴ rows; the digest holds ≤ 24 KB at 500 factors.
 - **Off-switch:** after 20 sessions that touched the store, the digest was read in fewer than half. That means nothing asked for current state, and the verb is removed rather than kept as decoration. Measured from agent transcripts — the store keeps no telemetry and must not start.
 - **Removal is the recovery path:** deleting the verb restores the frozen surface exactly, because the store itself holds no state for this feature.
 
 ## Non-functional requirements
-- **Size:** ≤ 64 factors and ≤ 4 KB of JSON, at any store size. Exceeding it is a bug, not a tuning knob.
+- **Size:** ≤ 64 factors and ≤ 24 KB of JSON, at any store size. The default read (`-k 8`) is about 2 KB at 200-character values. Exceeding the budget is a bug, not a tuning knob.
 - **Latency:** p95 < 50 ms for the digest read at 10⁴ rows — the bound `search` already holds.
 - **Read-only:** the digest never writes; pinned by a test.
 - **Portability:** one file, offline, no network listener, no external service.
@@ -77,14 +77,14 @@ content, one writer, soft forget, and no inference. This doc does not restate th
 
 ## Security & compliance
 - The digest echoes stored text to stdout, and so possibly into an agent transcript. That is the trust boundary `get` and `search` already have: one local user, one local file, loopback only. No new boundary is opened.
-- Three rules: the value only, never `extra` or the provenance columns; one line, cut at 200 characters; no redaction, because the store cannot distinguish a secret from a sentence and a guessed redaction would corrupt stored text on output.
+- Three rules: the value only, never `extra` or the provenance columns; the value and the title each one line, cut at 200 characters; no redaction, because the store cannot distinguish a secret from a sentence and a guessed redaction would corrupt stored text on output.
 - Compliance: N/A — one user, one local file, no network listener, no external service, no telemetry.
 
 ## Verification plan
 - Acceptance cases 1–8 → fixture tests in `store_test.go`, one per case, in the style of the existing lifecycle tests.
 - Empty store and space-only title → one test each.
 - Read-only → a test that pins the absence of a write path, like `TestMatchersHasNoWritePath`, plus a WAL-size check across one call.
-- Bound → a test that puts 500 factors and asserts ≤ 64 rows, ≤ 4 KB, and an exact `omitted`.
+- Bound → a test that puts 500 factors with non-ASCII, 200-character titles and values, and asserts ≤ 64 rows, ≤ 24 KB, and an exact `omitted`.
 - Latency → a `cmd/bench` p50/p95 line for the digest at 10⁴ rows, beside the existing search numbers.
 - KPI probes → ten standing-fact probes in `cmd/bench`, each scored yes or no, target 8 of 10.
 - CLI → `cmd/memstore/main_test.go`: `-k 200` clamps to 64, `-k 0` is empty, `-scope a,b` parses, an unknown flag is rejected.
