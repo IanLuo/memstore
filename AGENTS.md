@@ -36,9 +36,10 @@ nix develop --command go run ./cmd/bench
   returns it, best first. With zero shared stems and no embedder, the store
   returns fewer results, never a wrong one. The vector matcher is absent unless
   `SetEmbedder` is called; do not call the lexical path "search by meaning".
-- **The CLI verb surface is frozen**: `put get search recent link close forget stats`.
+- **The CLI verb surface is frozen**: `put get search recent link close forget stats profile`.
+  `profile` is read-only: a bounded digest of current factors (`.agents/specs/personal-profile.md`).
   `serve` starts the read-only UI; UI reads map only to existing `Stats`,
-  `Recent`, `Search`, and `Get` package methods.
+  `Recent`, `Search`, and `Get` package methods. The UI has no `profile` route.
 - **Content is immutable.** Only `status`, `deleted_at` and `tier` change after a
   put. A correction is a new row plus `close`, never an update.
 - **`forget` is one-way.** It sets `deleted_at`, and no verb restores it — a
@@ -77,6 +78,7 @@ store's only writer, and it writes provenance from the caller.
 cmd/memstore/     — CLI: parse args, call store, print JSON; serve starts web.
 cmd/bench/        — NFR harness: p50/p95, recall probes, size.
 store.go          — schema, lifecycle verbs, Search/Recent/Get/Stats.
+profile.go        — the personal-profile digest: a read over memory, no writes.
 matchers.go       — lexical ∪ optional vector ranking and related edges; read-only.
 web/              — read-only loopback UI using existing public store methods.
 .agents/specs/    — locked contract and system design.

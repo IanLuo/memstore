@@ -55,3 +55,44 @@ func TestErrorMessageOnePrefix(t *testing.T) {
 		}
 	}
 }
+
+// Personal profile, CLI: -scope takes a comma list and -k defaults to 8. A
+// comma list of one scope is that scope; an empty list means all scopes.
+func TestParseProfileArgs(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		args   []string
+		scopes []string
+		k      int
+	}{
+		{name: "defaults", args: nil, scopes: nil, k: 8},
+		{name: "one scope", args: []string{"-scope", "a"}, scopes: []string{"a"}, k: 8},
+		{name: "comma list", args: []string{"-scope", "a,b"}, scopes: []string{"a", "b"}, k: 8},
+		{name: "spaces trimmed", args: []string{"-scope", " a , b "}, scopes: []string{"a", "b"}, k: 8},
+		{name: "k over cap passes through", args: []string{"-k", "200"}, scopes: nil, k: 200},
+		{name: "k zero is empty", args: []string{"-k", "0"}, scopes: nil, k: 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			scopes, k, err := parseProfileArgs(tc.args)
+			if err != nil {
+				t.Fatalf("parseProfileArgs(%v): %v", tc.args, err)
+			}
+			if strings.Join(scopes, ",") != strings.Join(tc.scopes, ",") {
+				t.Errorf("scopes = %v, want %v", scopes, tc.scopes)
+			}
+			if k != tc.k {
+				t.Errorf("k = %d, want %d", k, tc.k)
+			}
+		})
+	}
+}
+
+// Personal profile, CLI: an unknown flag and stray positional arguments are
+// rejected, like every other verb.
+func TestParseProfileArgsRejects(t *testing.T) {
+	for _, args := range [][]string{{"-nope"}, {"stray"}} {
+		if _, _, err := parseProfileArgs(args); err == nil {
+			t.Errorf("parseProfileArgs(%v) accepted, want an error", args)
+		}
+	}
+}

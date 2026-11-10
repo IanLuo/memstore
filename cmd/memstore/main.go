@@ -39,6 +39,8 @@ func main() {
 		err = runLink(os.Args[2:])
 	case "stats":
 		err = runStats(os.Args[2:])
+	case "profile":
+		err = runProfile(os.Args[2:])
 	case "serve":
 		err = runServe(os.Args[2:])
 	default:
@@ -72,6 +74,7 @@ func usage() {
   recent [-k N] [SCOPE...]                        newest memories first, as JSON
   link FROM REL TO                                record an edge; the walk surfaces superseded-by / found-by
   stats                                           the store's shape: counts, file bytes, ts bounds
+  profile [-scope a,b] [-k N]                     bounded digest of current factors (read-only, JSON)
   serve [-port N]                                 read-only web view on 127.0.0.1 (default port 8765)
 
 The store is $MEMSTORE_DB, or ~/.memstore/memory.db.
@@ -265,6 +268,46 @@ func runStats(args []string) error {
 		return err
 	}
 	return writeJSON(st)
+}
+
+// parseProfileArgs reads the profile verb's flags: -scope is a comma list (empty
+// means all scopes) and -k defaults to 8. The store owns the cap at 64; the
+// parser passes the value through.
+func parseProfileArgs(args []string) ([]string, int, error) {
+	fs := flag.NewFlagSet("profile", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	scope := fs.String("scope", "", "comma-separated scopes to count (default all)")
+	k := fs.Int("k", 8, "maximum factors returned (capped at 64)")
+	if err := fs.Parse(args); err != nil {
+		return nil, 0, fmt.Errorf("profile: %w", err)
+	}
+	if fs.NArg() != 0 {
+		return nil, 0, fmt.Errorf("profile: takes no positional arguments")
+	}
+	var scopes []string
+	for _, sc := range strings.Split(*scope, ",") {
+		if sc = strings.TrimSpace(sc); sc != "" {
+			scopes = append(scopes, sc)
+		}
+	}
+	return scopes, *k, nil
+}
+
+func runProfile(args []string) error {
+	scopes, k, err := parseProfileArgs(args)
+	if err != nil {
+		return err
+	}
+	s, err := openStore()
+	if err != nil {
+		return err
+	}
+	defer s.Close()
+	d, err := s.Profile(scopes, k)
+	if err != nil {
+		return err
+	}
+	return writeJSON(d)
 }
 
 func openStore() (*memstore.Store, error) {

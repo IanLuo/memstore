@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"hash/fnv"
@@ -2162,5 +2163,232 @@ func TestStatsReportsVectorCoverage(t *testing.T) {
 	}
 	if *st.VectorRows != 1 || st.Total != 2 {
 		t.Errorf("coverage = %d/%d, want 1/2 — the pre-seam row has no vector", *st.VectorRows, st.Total)
+	}
+}
+
+// Personal profile, spec resolution: three live rows under one (kind, title)
+// are one factor — count 3, first and last seen, the newest open row's value.
+func TestProfileResolvesOneFactor(t *testing.T) {
+	s := openTemp(t)
+	for i, text := range []string{"first wording", "second wording", "newest wording"} {
+		if _, err := s.Put(&memstore.Memory{Kind: "preference", Title: "replies", Scope: "agent", Text: text, Ts: time.Unix(int64(100+i), 0)}); err != nil {
+			t.Fatalf("Put: %v", err)
+		}
+	}
+	d, err := s.Profile(nil, 8)
+	if err != nil {
+		t.Fatalf("Profile: %v", err)
+	}
+	if len(d.Factors) != 1 {
+		t.Fatalf("factors = %d, want 1", len(d.Factors))
+	}
+	f := d.Factors[0]
+	if f.Count != 3 || f.Value != "newest wording" {
+		t.Errorf("count=%d value=%q, want 3 and %q", f.Count, f.Value, "newest wording")
+	}
+	if !f.First.Equal(time.Unix(100, 0)) || !f.Last.Equal(time.Unix(102, 0)) {
+		t.Errorf("first=%v last=%v, want 100s and 102s", f.First, f.Last)
+	}
+}
+
+// Personal profile, spec retired version: a newer closed row does not win the
+// value; the older open row does.
+func TestProfileValueIsNewestOpen(t *testing.T) {
+	s := openTemp(t)
+	s.Put(&memstore.Memory{Kind: "preference", Title: "replies", Text: "oldest open", Ts: time.Unix(100, 0)})
+	mid, _ := s.Put(&memstore.Memory{Kind: "preference", Title: "replies", Text: "middle open", Ts: time.Unix(150, 0)})
+	closed, _ := s.Put(&memstore.Memory{Kind: "preference", Title: "replies", Text: "newest closed", Ts: time.Unix(200, 0)})
+	if err := s.CloseMemory(closed, nil); err != nil {
+		t.Fatalf("CloseMemory: %v", err)
+	}
+	_ = mid
+	d, err := s.Profile(nil, 8)
+	if err != nil {
+		t.Fatalf("Profile: %v", err)
+	}
+	if got := d.Factors[0].Value; got != "middle open" {
+		t.Errorf("value = %q, want the newest OPEN row (\"middle open\"), not the newer closed one", got)
+	}
+}
+
+// Personal profile, spec all closed: a factor with no open row keeps its count
+// and carries no value.
+func TestProfileAllClosedHasNoValue(t *testing.T) {
+	s := openTemp(t)
+	id, _ := s.Put(&memstore.Memory{Kind: "decision", Title: "old rule", Text: "retired rule", Ts: time.Unix(100, 0)})
+	if err := s.CloseMemory(id, nil); err != nil {
+		t.Fatalf("CloseMemory: %v", err)
+	}
+	d, err := s.Profile(nil, 8)
+	if err != nil {
+		t.Fatalf("Profile: %v", err)
+	}
+	if len(d.Factors) != 1 || d.Factors[0].Count != 1 || d.Factors[0].Value != "" {
+		t.Errorf("factors = %+v, want one entry with count 1 and no value", d.Factors)
+	}
+}
+
+// Personal profile, spec not a factor: an empty or space-only title, and a
+// forgotten row, are absent and count toward nothing.
+func TestProfileExcludesNonFactors(t *testing.T) {
+	s := openTemp(t)
+	s.Put(&memstore.Memory{Kind: "event", Title: "", Text: "untitled event"})
+	s.Put(&memstore.Memory{Kind: "event", Title: "   ", Text: "space-only title"})
+	gone, _ := s.Put(&memstore.Memory{Kind: "event", Title: "forgotten", Text: "gone"})
+	if err := s.Forget(gone); err != nil {
+		t.Fatalf("Forget: %v", err)
+	}
+	d, err := s.Profile(nil, 8)
+	if err != nil {
+		t.Fatalf("Profile: %v", err)
+	}
+	if len(d.Factors) != 0 || d.Omitted != 0 {
+		t.Errorf("factors=%+v omitted=%d, want none", d.Factors, d.Omitted)
+	}
+}
+
+// Personal profile, spec title rule: trimming and case-folding merge titles;
+// hyphens do not.
+func TestProfileTitleRule(t *testing.T) {
+	s := openTemp(t)
+	s.Put(&memstore.Memory{Kind: "error", Title: "Build timeout", Text: "a"})
+	s.Put(&memstore.Memory{Kind: "error", Title: "  build TIMEOUT  ", Text: "b"})
+	s.Put(&memstore.Memory{Kind: "error", Title: "build-timeout", Text: "c"})
+	d, err := s.Profile(nil, 8)
+	if err != nil {
+		t.Fatalf("Profile: %v", err)
+	}
+	if len(d.Factors) != 2 {
+		t.Fatalf("factors = %d, want 2 (\"Build timeout\" merges, \"build-timeout\" does not)", len(d.Factors))
+	}
+}
+
+// Personal profile, spec scopes: one title in two scopes is one factor under
+// the scope-agnostic identity; -scope filters which rows count.
+func TestProfileScopes(t *testing.T) {
+	s := openTemp(t)
+	s.Put(&memstore.Memory{Kind: "preference", Title: "tone", Scope: "a", Text: "x"})
+	s.Put(&memstore.Memory{Kind: "preference", Title: "tone", Scope: "b", Text: "y"})
+	s.Put(&memstore.Memory{Kind: "preference", Title: "tone", Scope: "b", Text: "z"})
+
+	d, _ := s.Profile([]string{"a", "b"}, 8)
+	if len(d.Factors) != 1 || d.Factors[0].Count != 3 || d.Factors[0].Scopes != 2 {
+		t.Errorf("both scopes: %+v, want one factor, count 3, two scopes", d.Factors)
+	}
+	d, _ = s.Profile([]string{"a"}, 8)
+	if len(d.Factors) != 1 || d.Factors[0].Count != 1 || d.Factors[0].Scopes != 1 {
+		t.Errorf("scope a: %+v, want count 1, one scope", d.Factors)
+	}
+}
+
+// Personal profile, row cap: 100 short factors fit the byte budget easily, so
+// only the 64-row cap can cut them. Exactly 64 return and 36 are omitted.
+func TestProfileRowCapBinds(t *testing.T) {
+	s := openTemp(t)
+	for i := 0; i < 100; i++ {
+		s.Put(&memstore.Memory{Kind: "error", Title: fmt.Sprintf("t%03d", i), Text: "x", Ts: time.Unix(int64(1000+i), 0)})
+	}
+	d, err := s.Profile(nil, 100)
+	if err != nil {
+		t.Fatalf("Profile: %v", err)
+	}
+	if len(d.Factors) != 64 || d.Omitted != 36 {
+		t.Errorf("rows=%d omitted=%d, want 64 and 36", len(d.Factors), d.Omitted)
+	}
+}
+
+// Personal profile, spec bound: 500 factors with non-ASCII 200-character
+// titles and values stay within 64 rows and 24 KB, and omitted is exact.
+func TestProfileBoundHolds(t *testing.T) {
+	s := openTemp(t)
+	long := strings.Repeat("é", 200)
+	for i := 0; i < 500; i++ {
+		title := fmt.Sprintf("%s-%03d", long, i)
+		if _, err := s.Put(&memstore.Memory{Kind: "error", Title: title, Text: long, Ts: time.Unix(int64(1000+i), 0)}); err != nil {
+			t.Fatalf("Put: %v", err)
+		}
+	}
+	d, err := s.Profile(nil, 500)
+	if err != nil {
+		t.Fatalf("Profile: %v", err)
+	}
+	if len(d.Factors) > 64 {
+		t.Errorf("rows = %d, want ≤ 64", len(d.Factors))
+	}
+	b, _ := json.Marshal(d)
+	if len(b) > 24*1024 {
+		t.Errorf("JSON = %d bytes, want ≤ 24 KB", len(b))
+	}
+	if len(d.Factors)+d.Omitted != 500 {
+		t.Errorf("rows %d + omitted %d != 500 factors", len(d.Factors), d.Omitted)
+	}
+}
+
+// Personal profile, spec order tie-break: with Last, Count and Scopes equal,
+// titles order ascending. The title is the last key, so this is the only rule
+// that decides.
+func TestProfileTitleTieBreakAscending(t *testing.T) {
+	s := openTemp(t)
+	s.Put(&memstore.Memory{Kind: "error", Title: "zeta", Text: "a", Ts: time.Unix(500, 0)})
+	s.Put(&memstore.Memory{Kind: "error", Title: "alpha", Text: "b", Ts: time.Unix(500, 0)})
+	d, err := s.Profile(nil, 8)
+	if err != nil {
+		t.Fatalf("Profile: %v", err)
+	}
+	if len(d.Factors) != 2 || d.Factors[0].Title != "alpha" || d.Factors[1].Title != "zeta" {
+		t.Errorf("order = %q, %q; want alpha then zeta", d.Factors[0].Title, d.Factors[1].Title)
+	}
+}
+
+// Personal profile, spec order: the most recently seen factor is returned first
+// under a cap of one.
+func TestProfileOrderLastSeenFirst(t *testing.T) {
+	s := openTemp(t)
+	s.Put(&memstore.Memory{Kind: "error", Title: "older factor", Text: "a", Ts: time.Unix(100, 0)})
+	s.Put(&memstore.Memory{Kind: "error", Title: "newer factor", Text: "b", Ts: time.Unix(900, 0)})
+	d, err := s.Profile(nil, 1)
+	if err != nil {
+		t.Fatalf("Profile: %v", err)
+	}
+	if len(d.Factors) != 1 || d.Factors[0].Title != "newer factor" {
+		t.Errorf("k=1 returned %+v, want the later-seen factor", d.Factors)
+	}
+}
+
+// Personal profile, spec determinism and empty store.
+func TestProfileDeterministicAndEmpty(t *testing.T) {
+	s := openTemp(t)
+	d, err := s.Profile(nil, 8)
+	if err != nil {
+		t.Fatalf("Profile on empty store: %v", err)
+	}
+	if d.Factors == nil || len(d.Factors) != 0 {
+		t.Errorf("empty store factors = %v, want an empty list, not nil", d.Factors)
+	}
+	s.Put(&memstore.Memory{Kind: "error", Title: "one", Text: "a"})
+	s.Put(&memstore.Memory{Kind: "error", Title: "two", Text: "b"})
+	a, _ := json.Marshal(mustProfile(t, s))
+	b, _ := json.Marshal(mustProfile(t, s))
+	if string(a) != string(b) {
+		t.Errorf("two reads differ:\n%s\n%s", a, b)
+	}
+}
+
+func mustProfile(t *testing.T, s *memstore.Store) memstore.Digest {
+	t.Helper()
+	d, err := s.Profile(nil, 8)
+	if err != nil {
+		t.Fatalf("Profile: %v", err)
+	}
+	return d
+}
+
+// Personal profile, spec read-only: the profile path issues no write statement.
+func TestProfileHasNoWritePath(t *testing.T) {
+	src := readSource(t, "profile.go")
+	for _, banned := range []string{"Exec(", "CREATE ", "INSERT INTO", "UPDATE ", "DELETE FROM"} {
+		if strings.Contains(src, banned) {
+			t.Errorf("profile.go contains %q — the digest must hold no write path", banned)
+		}
 	}
 }

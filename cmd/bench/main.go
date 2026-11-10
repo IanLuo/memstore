@@ -14,6 +14,10 @@
 // scope-listing read, Store.Recent(scope, k), with the spread and the
 // EXPLAIN QUERY PLAN beside it — the read cost this store's scope index exists
 // to hold down.
+//
+// Part D times the personal-profile digest, Store.Profile(nil, 8), over a
+// generated store at the largest size in -n, against the spec's p95 bound. It
+// reads the same generated store Part A does, never the real file.
 package main
 
 import (
@@ -183,6 +187,11 @@ func main() {
 	if cfg.part == "c" || cfg.part == "all" {
 		if err := partC(cfg); err != nil {
 			fatal("part C: %v", err)
+		}
+	}
+	if cfg.part == "d" || cfg.part == "all" {
+		if err := partD(cfg); err != nil {
+			fatal("part D: %v", err)
 		}
 	}
 }
@@ -460,6 +469,67 @@ func printSpread(label string, rows int, xs []float64) {
 // The before/after pair is not two code paths here: run this part against a
 // store the previous revision wrote (schema_version 5) and again against the
 // same store once Open has carried it to the current version, one protocol each.
+// profileBoundMs is the personal-profile read's p95 bound (.agents/specs/
+// personal-profile.md, Non-functional requirements): under 50 ms at 10^4 rows.
+const profileBoundMs = 50.0
+
+// partD times the digest read over a generated store at the largest size in
+// the -n list. The corpus is the same synthetic one Part A uses; the digest's
+// verdict is a bound, so it prints PASS or FAIL against profileBoundMs.
+func partD(cfg config) error {
+	if len(cfg.sizes) == 0 {
+		return fmt.Errorf("no sizes")
+	}
+	n := cfg.sizes[len(cfg.sizes)-1]
+	fmt.Printf("=== Part D: personal-profile digest read (Profile k=8) at N=%d ===\n", n)
+	path := filepath.Join(cfg.work, "profile.db")
+	s, err := memstore.Open(path)
+	if err != nil {
+		return err
+	}
+	defer s.Close()
+	for i, m := range corpus(n) {
+		// The digest reads titled factors. Part A's corpus has no title, so
+		// every row would be excluded and the timing would measure the
+		// empty-title fast path. Give each row a title drawn from a fixed
+		// set of 50, and vary kind and scope, so the read does real work.
+		m.Title = fmt.Sprintf("title %02d", i%50)
+		m.Kind = []string{"error", "decision", "preference", "gate", "build", "event"}[i%6]
+		m.Scope = []string{"fs:a", "fs:b", "personal", "agent"}[i%4]
+		if _, err := s.Put(&m); err != nil {
+			return fmt.Errorf("put: %w", err)
+		}
+	}
+	for i := 0; i < cfg.warmup; i++ {
+		if _, err := s.Profile(nil, 8); err != nil {
+			return err
+		}
+	}
+	ms := make([]float64, 0, cfg.runs)
+	var d memstore.Digest
+	for i := 0; i < cfg.runs; i++ {
+		t := time.Now()
+		d, err = s.Profile(nil, 8)
+		if err != nil {
+			return err
+		}
+		ms = append(ms, ms2(t))
+	}
+	sort.Float64s(ms)
+	p95 := pctl(ms, 95)
+	verdict := "PASS"
+	if p95 >= profileBoundMs {
+		verdict = "FAIL"
+	}
+	printSpread("Profile(k=8)", n, ms)
+	fmt.Printf("digest: %d factors returned, %d omitted\n", len(d.Factors), d.Omitted)
+	fmt.Printf("bound p95 < %.0f ms: %s (p95 %.3f ms)\n\n", profileBoundMs, verdict, p95)
+	return nil
+}
+
+// ms2 is the elapsed time since t, in milliseconds.
+func ms2(t time.Time) float64 { return float64(time.Since(t).Nanoseconds()) / 1e6 }
+
 func partC(cfg config) error {
 	fmt.Printf("=== Part C: scope-listing read cost (Recent) ===\n")
 	srcStat, err := os.Stat(cfg.memsrc)

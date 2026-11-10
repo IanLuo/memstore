@@ -12,7 +12,9 @@ The spec is the record of decisions. Do not re-decide any of them here:
 
 - Identity is `(kind, title)`, title trimmed and case-folded. Scope is an angle, not identity.
 - Value is the newest **open** row's text. An all-closed factor has a count and no value.
-- Order is last-seen desc, then count desc, then scope, then title. Silent truncation is a bug.
+- Order is last-seen desc, then count desc, then scope count desc, then title asc. Silent truncation is a bug.
+  Build note: the card said "scope". A merged factor spans several scopes, so no single scope name can
+  order it. The key is the distinct-scope count. The title tie-break is ascending.
 - Bound is 64 factors and 24 KB of JSON. The byte budget is enforced while building output.
 - The verb is `profile [-scope a,b] [-k 8]`. Cap 64, `-k ≤ 0` is empty.
 
