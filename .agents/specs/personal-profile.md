@@ -1,4 +1,4 @@
-<!-- specs:locked:f63a63c 2026-11-08 type=spec -->
+<!-- specs:locked:41bc56e 2026-11-10 type=spec -->
 
 ## Link contract
 - **upstream** (this doc relies on): .agents/specs/memory-store.md
