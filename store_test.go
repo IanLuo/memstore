@@ -2348,6 +2348,45 @@ func TestProfileTitleTieBreakAscending(t *testing.T) {
 	}
 }
 
+// Personal profile, spec determinism: kind is half of a factor's identity, so
+// two factors that differ only in kind are two factors and the order key must
+// decide between them. Before the kind rung they tied, and sort.Slice left
+// them in Go's randomized map order — the same store answered differently
+// between reads, and at k=1 it answered with either kind.
+func TestProfileKindTieBreakIsDeterministic(t *testing.T) {
+	s := openTemp(t)
+	for _, kind := range []string{"alpha", "zeta"} {
+		s.Put(&memstore.Memory{Kind: kind, Title: "same title", Text: kind, Ts: time.Unix(500, 0)})
+	}
+
+	var whole string
+	for i := 0; i < 50; i++ {
+		b, _ := json.Marshal(mustProfile(t, s))
+		if i == 0 {
+			whole = string(b)
+			continue
+		}
+		if string(b) != whole {
+			t.Fatalf("read %d differs:\n%s\n%s", i, whole, b)
+		}
+	}
+
+	d := mustProfile(t, s)
+	if len(d.Factors) != 2 || d.Factors[0].Kind != "alpha" || d.Factors[1].Kind != "zeta" {
+		t.Fatalf("order = %+v; want alpha then zeta", d.Factors)
+	}
+
+	for i := 0; i < 50; i++ {
+		one, err := s.Profile(nil, 1)
+		if err != nil {
+			t.Fatalf("Profile k=1: %v", err)
+		}
+		if len(one.Factors) != 1 || one.Factors[0].Kind != "alpha" {
+			t.Fatalf("k=1 read %d returned %+v; want alpha", i, one.Factors)
+		}
+	}
+}
+
 // Personal profile, spec order: the most recently seen factor is returned first
 // under a cap of one.
 func TestProfileOrderLastSeenFirst(t *testing.T) {

@@ -171,7 +171,9 @@ func (a *factorAcc) finish() Factor {
 }
 
 // factorBefore is the spec's order: last seen first, then repeat count, then
-// scope count, then title. It is total, so the digest is deterministic.
+// scope count, then title. A factor's identity is (kind, title), so the kind
+// closes the order: without it two kinds sharing a title tie, and sort leaves
+// them in map order, which is random.
 func factorBefore(a, b Factor) bool {
 	if !a.Last.Equal(b.Last) {
 		return a.Last.After(b.Last)
@@ -182,7 +184,10 @@ func factorBefore(a, b Factor) bool {
 	if a.Scopes != b.Scopes {
 		return a.Scopes > b.Scopes
 	}
-	return a.Title < b.Title
+	if a.Title != b.Title {
+		return a.Title < b.Title
+	}
+	return a.Kind < b.Kind
 }
 
 // fitDigest takes the first k factors and keeps adding them while the digest's
