@@ -18,6 +18,10 @@
 // Part D times the personal-profile digest, Store.Profile(nil, 8), over a
 // generated store at the largest size in -n, against the spec's p95 bound. It
 // reads the same generated store Part A does, never the real file.
+//
+// Part E scores the digest's KPI: ten standing facts, each put three times among
+// older single-occurrence noise, and the digest alone must surface at least
+// eight of the ten without a search (.agents/specs/personal-profile.md, KPIs).
 package main
 
 import (
@@ -144,7 +148,7 @@ func main() {
 		passes   = flag.Int("passes", 3, "timed passes over the query set")
 		openReps = flag.Int("openreps", 30, "open repetitions per phase")
 		work     = flag.String("work", "", "working directory (default: a fresh temp dir)")
-		part     = flag.String("part", "all", "a, c, or all")
+		part     = flag.String("part", "all", "a, c, d, e, or all")
 		memsrc   = flag.String("memsrc", "~/.memstore/memory.db", "memstore file for part C (copied, never opened in place)")
 		scopeK   = flag.Int("scopek", 1<<20, "k a scope listing asks for in part C (fs's recentLimit)")
 		runs     = flag.Int("runs", 30, "timed runs per scope in part C")
@@ -192,6 +196,11 @@ func main() {
 	if cfg.part == "d" || cfg.part == "all" {
 		if err := partD(cfg); err != nil {
 			fatal("part D: %v", err)
+		}
+	}
+	if cfg.part == "e" || cfg.part == "all" {
+		if err := partE(cfg); err != nil {
+			fatal("part E: %v", err)
 		}
 	}
 }
@@ -524,6 +533,82 @@ func partD(cfg config) error {
 	printSpread("Profile(k=8)", n, ms)
 	fmt.Printf("digest: %d factors returned, %d omitted\n", len(d.Factors), d.Omitted)
 	fmt.Printf("bound p95 < %.0f ms: %s (p95 %.3f ms)\n\n", profileBoundMs, verdict, p95)
+	return nil
+}
+
+// The digest KPI: ten standing-fact probes, at least eight answered by the
+// digest alone. A "probe" is a standing fact — repeated, recent — that a cold
+// session would need without searching for it.
+const (
+	profileProbes       = 10
+	profileProbeTarget  = 8
+	profileProbeRepeats = 3
+	profileNoiseFactors = 300
+)
+
+// partE scores the KPI. Each fact is put three times at the newest timestamps;
+// the noise is one row per distinct title, older. Nothing is searched for: the
+// digest is read once at its cap, and a fact counts as answered when its
+// (kind, title) is among the returned factors.
+func partE(cfg config) error {
+	fmt.Printf("=== Part E: personal-profile KPI probes (target %d of %d) ===\n", profileProbeTarget, profileProbes)
+	s, err := memstore.Open(filepath.Join(cfg.work, "probes.db"))
+	if err != nil {
+		return err
+	}
+	defer s.Close()
+	base := time.Unix(1_780_000_000, 0)
+	for i := 0; i < profileNoiseFactors; i++ {
+		if _, err := s.Put(&memstore.Memory{
+			Kind:  "event",
+			Title: fmt.Sprintf("noise %03d", i),
+			Text:  "one-off event",
+			Ts:    base.Add(time.Duration(i) * time.Second),
+		}); err != nil {
+			return err
+		}
+	}
+	want := make([]struct{ kind, title string }, profileProbes)
+	for i := 0; i < profileProbes; i++ {
+		kind, title := "preference", fmt.Sprintf("standing fact %02d", i)
+		want[i] = struct{ kind, title string }{kind, title}
+		for r := 0; r < profileProbeRepeats; r++ {
+			if _, err := s.Put(&memstore.Memory{
+				Kind:  kind,
+				Title: title,
+				Text:  fmt.Sprintf("statement %d of fact %02d", r, i),
+				Ts:    base.Add(time.Duration(1_000_000+i*100+r) * time.Second),
+			}); err != nil {
+				return err
+			}
+		}
+	}
+	d, err := s.Profile(nil, 64)
+	if err != nil {
+		return err
+	}
+	seen := make(map[string]bool, len(d.Factors))
+	for _, f := range d.Factors {
+		seen[f.Kind+"\x00"+strings.ToLower(strings.TrimSpace(f.Title))] = true
+	}
+	hits := 0
+	for i, w := range want {
+		hit := seen[w.kind+"\x00"+w.title]
+		if hit {
+			hits++
+		}
+		verdict := "MISS"
+		if hit {
+			verdict = "hit"
+		}
+		fmt.Printf("  probe %02d  %-8s  %s\n", i+1, verdict, w.title)
+	}
+	fmt.Printf("  score %d/%d  digest returned %d factors, %d omitted\n", hits, profileProbes, len(d.Factors), d.Omitted)
+	overall := "PASS"
+	if hits < profileProbeTarget {
+		overall = "FAIL"
+	}
+	fmt.Printf("  bound ≥ %d/%d answered by the digest alone: %s\n\n", profileProbeTarget, profileProbes, overall)
 	return nil
 }
 

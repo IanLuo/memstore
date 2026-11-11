@@ -2400,3 +2400,150 @@ func TestProfileHasNoWritePath(t *testing.T) {
 		}
 	}
 }
+
+// Personal profile, spec read-only, the WAL half: a profile read commits
+// nothing. The source test above proves no write statement exists; this one
+// proves the file is untouched anyway, which is what a caller sharing it would
+// notice. The WAL size is checked because the card asks for it, but size alone
+// is weak — SQLite grows the log in chunks, so a few frames leave it unchanged.
+// PRAGMA data_version on a second connection is the real detector: it moves
+// when another connection commits. A write added to Profile is caught twice
+// over: TestProfileHasNoWritePath names it, and this test deadlocks, because
+// Profile holds its read cursor open, so the write waits on it — run the test
+// with -timeout 20s and a regression fails in seconds instead of hanging.
+func TestProfileCommitsNothing(t *testing.T) {
+	path := t.TempDir() + "/memory.db"
+	s, err := memstore.Open(path)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer s.Close()
+	for i := 0; i < 20; i++ {
+		if _, err := s.Put(&memstore.Memory{Kind: "error", Title: fmt.Sprintf("t%02d", i%5), Text: "x"}); err != nil {
+			t.Fatalf("Put: %v", err)
+		}
+	}
+	// A second connection: data_version reports commits made by others.
+	watch, err := sql.Open("sqlite", "file:"+path)
+	if err != nil {
+		t.Fatalf("open watcher: %v", err)
+	}
+	defer watch.Close()
+	dataVersion := func() int64 {
+		var v int64
+		if err := watch.QueryRow("PRAGMA data_version").Scan(&v); err != nil {
+			t.Fatalf("data_version: %v", err)
+		}
+		return v
+	}
+	walBytes := func() int64 {
+		fi, err := os.Stat(path + "-wal")
+		if err != nil {
+			return 0
+		}
+		return fi.Size()
+	}
+	beforeVersion, beforeWal := dataVersion(), walBytes()
+	if beforeWal == 0 {
+		t.Fatal("no WAL after 20 puts — this test would prove nothing")
+	}
+	for i := 0; i < 5; i++ {
+		if _, err := s.Profile(nil, 8); err != nil {
+			t.Fatalf("Profile: %v", err)
+		}
+		if _, err := s.Profile([]string{"", "a", "b"}, 64); err != nil {
+			t.Fatalf("Profile scoped: %v", err)
+		}
+	}
+	if got := dataVersion(); got != beforeVersion {
+		t.Errorf("data_version moved %d -> %d across 10 profile reads — the read committed", beforeVersion, got)
+	}
+	if got := walBytes(); got != beforeWal {
+		t.Errorf("WAL grew from %d to %d bytes across 10 profile reads", beforeWal, got)
+	}
+}
+
+// Personal profile, spec bound, as an invariant rather than one fixture: for
+// any mix of row shapes, the digest that Profile returns prints within 24 KB.
+// A single fixture cannot see the omitted-digit bug — the measurement has to be
+// wrong by exactly the printed width of "omitted", which is one or two bytes on
+// one particular row count. Sweeping the shapes finds that window.
+func TestProfilePrintedBoundAlwaysHolds(t *testing.T) {
+	const bound = 24 * 1024
+	shapes := []struct {
+		factors, titleLen, valueLen int
+	}{
+		{200, 200, 200}, {200, 200, 3}, {120, 190, 0}, {100, 200, 40},
+		{90, 200, 120}, {80, 120, 200}, {150, 60, 60}, {64, 200, 200},
+		{500, 10, 10}, {300, 200, 0},
+	}
+	for _, sh := range shapes {
+		s := openTemp(t)
+		for i := 0; i < sh.factors; i++ {
+			title := strings.Repeat("é", sh.titleLen) + fmt.Sprintf("%03d", i%997)
+			value := "ü"
+			if sh.valueLen > 0 {
+				value = strings.Repeat("ü", sh.valueLen)
+			}
+			ts := time.Unix(int64(1000+i), 0)
+			if _, err := s.Put(&memstore.Memory{Kind: "error", Title: title, Text: value, Scope: "b", Ts: ts}); err != nil {
+				t.Fatalf("Put: %v", err)
+			}
+		}
+		d, err := s.Profile(nil, 200)
+		if err != nil {
+			t.Fatalf("Profile: %v", err)
+		}
+		b, _ := json.MarshalIndent(d, "", "  ")
+		b = append(b, '\n')
+		if len(b) > bound {
+			t.Errorf("factors=%d title=%d value=%d: printed %d bytes, over the %d bound by %d (omitted=%d, rows=%d)",
+				sh.factors, sh.titleLen, sh.valueLen, len(b), bound, len(b)-bound, d.Omitted, len(d.Factors))
+		}
+		if len(d.Factors)+d.Omitted != sh.factors {
+			t.Errorf("rows %d + omitted %d != %d factors", len(d.Factors), d.Omitted, sh.factors)
+		}
+	}
+}
+
+// Personal profile, spec bound: the exact shape that exposed the measurement
+// bug. fitDigest used to measure each candidate with Omitted left at 0, whose
+// width is one byte, while the printed digest carries "omitted": 161 — two
+// bytes wider. On this shape that let a 39th row through and the CLI printed
+// 24,578 bytes against a 24,576 bound. The tuned row is the newest, so it is the
+// first factor kept: 200 factors whose titles are 200 runes long, and a newest
+// value of 141 runes. Both lengths are at or under capText's cap, so nothing is
+// truncated and the shape is exactly the one swept for.
+func TestProfileBoundOneByteWindow(t *testing.T) {
+	const bound = 24 * 1024
+	s := openTemp(t)
+	base := time.Unix(1_700_000_000, 0)
+	for i := 0; i < 200; i++ {
+		value := "ü"
+		if i == 199 {
+			value = strings.Repeat("ü", 141)
+		}
+		if _, err := s.Put(&memstore.Memory{
+			Kind:  "error",
+			Title: strings.Repeat("é", 197) + fmt.Sprintf("%03d", i%997),
+			Text:  value,
+			Scope: "b",
+			Ts:    base.Add(time.Duration(i) * time.Second),
+		}); err != nil {
+			t.Fatalf("Put: %v", err)
+		}
+	}
+	d, err := s.Profile(nil, 200)
+	if err != nil {
+		t.Fatalf("Profile: %v", err)
+	}
+	b, _ := json.MarshalIndent(d, "", "  ")
+	b = append(b, '\n')
+	if len(b) > bound {
+		t.Fatalf("printed %d bytes, over the %d bound by %d (rows %d, omitted %d)",
+			len(b), bound, len(b)-bound, len(d.Factors), d.Omitted)
+	}
+	if len(d.Factors)+d.Omitted != 200 {
+		t.Errorf("rows %d + omitted %d != 200", len(d.Factors), d.Omitted)
+	}
+}

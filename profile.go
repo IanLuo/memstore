@@ -191,18 +191,22 @@ func factorBefore(a, b Factor) bool {
 // the cut is a suffix, and omitted counts it exactly. The measurement is exact,
 // not estimated, and bounded by the 64-factor cap.
 func fitDigest(factors []Factor, k int) ([]Factor, int, error) {
+	total := len(factors)
 	out := []Factor{}
 	for i, f := range factors {
 		if i == k {
-			return out, len(factors) - i, nil
+			return out, total - i, nil
 		}
 		candidate := append(out, f)
-		b, err := digestJSON(Digest{Factors: candidate})
+		// Measure with the omitted count this candidate would print. Measuring
+		// with a zero would under-count a three-digit omitted by two bytes and
+		// let the output cross the bound by that much.
+		b, err := digestJSON(Digest{Factors: candidate, Omitted: total - len(candidate)})
 		if err != nil {
 			return out, 0, fmt.Errorf("memstore: profile: encode digest: %w", err)
 		}
 		if len(b) > digestMaxBytes {
-			return out, len(factors) - i, nil
+			return out, total - i, nil
 		}
 		out = candidate
 	}
