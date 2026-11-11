@@ -2315,9 +2315,17 @@ func TestProfileBoundHolds(t *testing.T) {
 	if len(d.Factors) > 64 {
 		t.Errorf("rows = %d, want ≤ 64", len(d.Factors))
 	}
-	b, _ := json.Marshal(d)
+	// The bound is on the JSON the CLI prints: an Encoder with
+	// SetIndent("", "  ") writes MarshalIndent plus a trailing newline. Compact
+	// JSON is ~8% smaller, so asserting on it would pass a payload that
+	// overflows the bound on stdout.
+	b, _ := json.MarshalIndent(d, "", "  ")
+	b = append(b, '\n')
 	if len(b) > 24*1024 {
-		t.Errorf("JSON = %d bytes, want ≤ 24 KB", len(b))
+		t.Errorf("printed JSON = %d bytes, want ≤ 24 KB", len(b))
+	}
+	if compact, _ := json.Marshal(d); len(compact) == len(b) {
+		t.Error("indented and compact sizes match, so this test cannot see the difference")
 	}
 	if len(d.Factors)+d.Omitted != 500 {
 		t.Errorf("rows %d + omitted %d != 500 factors", len(d.Factors), d.Omitted)

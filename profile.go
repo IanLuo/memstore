@@ -17,6 +17,19 @@ const (
 	digestTextCap    = 200
 )
 
+// digestJSON is the digest as the CLI prints it: json.MarshalIndent with a
+// two-space indent and a trailing newline, which is what an Encoder with
+// SetIndent("", "  ") writes. The byte bound is measured on these bytes, not on
+// compact JSON — the two differ by roughly 8% at 64 factors, and the bound has
+// to hold on what actually leaves the process.
+func digestJSON(d Digest) ([]byte, error) {
+	b, err := json.MarshalIndent(d, "", "  ")
+	if err != nil {
+		return nil, err
+	}
+	return append(b, '\n'), nil
+}
+
 // Factor is one resolved (kind, title) identity: its repeat count, when it was
 // first and last seen, the newest open row's text, and the live/closed split.
 // Value is empty when no row is open. Scopes counts the distinct scopes the
@@ -172,30 +185,26 @@ func factorBefore(a, b Factor) bool {
 	return a.Title < b.Title
 }
 
-// fitDigest takes the first k factors and keeps adding them while the JSON
-// stays within the byte budget. A factor that would break the budget is cut,
-// and so is every factor after it: the order is the contract, so the cut is a
-// suffix, and omitted counts it exactly.
+// fitDigest takes the first k factors and keeps adding them while the digest's
+// printed JSON stays within the byte budget. A factor that would break the
+// budget is cut, and so is every factor after it: the order is the contract, so
+// the cut is a suffix, and omitted counts it exactly. The measurement is exact,
+// not estimated, and bounded by the 64-factor cap.
 func fitDigest(factors []Factor, k int) ([]Factor, int, error) {
 	out := []Factor{}
-	used := len(`{"factors":[],"omitted":0}`)
 	for i, f := range factors {
 		if i == k {
 			return out, len(factors) - i, nil
 		}
-		b, err := json.Marshal(f)
+		candidate := append(out, f)
+		b, err := digestJSON(Digest{Factors: candidate})
 		if err != nil {
-			return out, 0, fmt.Errorf("memstore: profile: encode factor: %w", err)
+			return out, 0, fmt.Errorf("memstore: profile: encode digest: %w", err)
 		}
-		cost := len(b)
-		if len(out) > 0 {
-			cost++ // the separating comma
-		}
-		if used+cost > digestMaxBytes {
+		if len(b) > digestMaxBytes {
 			return out, len(factors) - i, nil
 		}
-		used += cost
-		out = append(out, f)
+		out = candidate
 	}
 	return out, 0, nil
 }
